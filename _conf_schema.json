@@ -1,0 +1,92 @@
+{
+  "enable_detect": {
+    "description": "自动认别人家的 AI",
+    "type": "bool",
+    "default": true,
+    "hint": "看着像机器人的号攒够几条消息后，让模型看一眼它最近的话和行为。关掉就只剩对聊刹车和手动名单。"
+  },
+  "judge_provider_id": {
+    "description": "判断用哪个模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空 = 用这个群当前的对话模型。换成便宜的小模型也行（一次判断大约 1~2 千 token）。"
+  },
+  "judge_threshold": {
+    "description": "模型把握多少才标",
+    "type": "int",
+    "default": 75,
+    "hint": "模型说「是 AI」而且把握 ≥ 这个数 → 标。"
+  },
+  "judge_threshold_low": {
+    "description": "行为也像机器人时 把握多少就标",
+    "type": "int",
+    "default": 65,
+    "hint": "模型说「是 AI」把握 ≥ 这个数、而且行为分 ≥ 下面那个数（秒接、连发、自称本鱼/本小姐、框架输出……）→ 也标。"
+  },
+  "judge_low_min_score": {
+    "description": "行为分要多少",
+    "type": "int",
+    "default": 8
+  },
+  "judge_daily_max": {
+    "description": "每天最多让模型看几次",
+    "type": "int",
+    "default": 300
+  },
+  "bot_reply_limit": {
+    "description": "认出来的 AI：每段时间最多回几次",
+    "type": "int",
+    "default": 3,
+    "hint": "只有它 @ / 引用你的机器人时才回，而且这段时间里最多回这么多次。它没找你的机器人时一律不主动接。"
+  },
+  "bot_reply_window_sec": {
+    "description": "认出来的 AI：多长时间算一段（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "brake_enable": {
+    "description": "对聊刹车",
+    "type": "bool",
+    "default": true,
+    "hint": "还没认出来的号：跟你的机器人来回太快太多、又像机器人 → 先停一会儿不回它，同时让模型再看一眼。"
+  },
+  "brake_rounds": {
+    "description": "刹车：来回几轮",
+    "type": "int",
+    "default": 8
+  },
+  "brake_window_sec": {
+    "description": "刹车：多长时间里数轮数（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "brake_fast_sec": {
+    "description": "刹车：你的机器人说完多少秒内就接上算「秒接」",
+    "type": "int",
+    "default": 20,
+    "hint": "大模型生成一句要 10~20 秒，所以别人家的 AI 一般在这个时间里接上。"
+  },
+  "brake_pause_sec": {
+    "description": "刹车：停多久（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "never_bot": {
+    "description": "永远当真人的 QQ 号",
+    "type": "list",
+    "default": [],
+    "hint": "AstrBot 的管理员本来就不会被标。"
+  },
+  "always_bot": {
+    "description": "手动认定是 AI 的 QQ 号",
+    "type": "list",
+    "default": []
+  },
+  "groups": {
+    "description": "只在这些群里管（群号）",
+    "type": "list",
+    "default": [],
+    "hint": "留空 = 所有群。"
+  }
+}

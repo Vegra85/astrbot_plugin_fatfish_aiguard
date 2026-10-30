@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>认 AI + 对聊刹车</title>
+<style>
+  :root { --bg:#ffffff; --fg:#1f2328; --muted:#656d76; --line:#e5e7eb; --card:#f6f8fa; --accent:#2563eb; --bad:#c2410c; --ok:#15803d; }
+  html[data-theme="dark"] { --bg:#16181d; --fg:#e6e6e6; --muted:#9aa4b2; --line:#2c313a; --card:#1e2128; --accent:#60a5fa; --bad:#fb923c; --ok:#4ade80; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:14px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:22px 0 8px; }
+  .sub { color:var(--muted); margin:0 0 14px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .card b { display:block; font-size:22px; }
+  .card span { color:var(--muted); font-size:12px; }
+  .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:10px; }
+  table { border-collapse:collapse; width:100%; min-width:560px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; background:var(--card); }
+  tr:last-child td { border-bottom:none; }
+  .empty { color:var(--muted); padding:10px; }
+  .tag { display:inline-block; padding:0 6px; border-radius:6px; font-size:12px; border:1px solid var(--line); white-space:nowrap; }
+  th { white-space:nowrap; }
+  .tag.ai { color:var(--bad); border-color:var(--bad); }
+  .tag.human { color:var(--ok); border-color:var(--ok); }
+  button { font:inherit; font-size:12px; padding:3px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; margin:0 4px 2px 0; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  .log li { margin:2px 0; }
+  .log { padding-left:18px; margin:0; }
+  .muted { color:var(--muted); }
+  #err { color:var(--bad); }
+</style>
+</head>
+<body>
+<h1>认 AI + 对聊刹车</h1>
+<p class="sub">不用填名单：群里别人部署的 AI 它自己认。认出来的只有 @ / 引用你的机器人才回，而且有次数上限。认错了点「改成真人」。</p>
+<div id="err"></div>
+<div class="cards">
+  <div class="card"><b id="n-bots">-</b><span>认出来的别人家的 AI</span></div>
+  <div class="card"><b id="n-brakes">-</b><span>现在刹着的</span></div>
+  <div class="card"><b id="n-judged">-</b><span>今天让模型看了几次</span></div>
+  <div class="card"><b id="n-humans">-</b><span>记成真人的</span></div>
+</div>
+
+<h2>认出来的别人家的 AI</h2>
+<div class="wrap"><table id="t-bots"></table></div>
+
+<h2>最近的判断</h2>
+<div class="wrap"><table id="t-verdicts"></table></div>
+
+<h2>现在刹着的</h2>
+<div class="wrap"><table id="t-brakes"></table></div>
+
+<h2>记成真人的</h2>
+<div class="wrap"><table id="t-humans"></table></div>
+
+<h2>最近发生的</h2>
+<ul class="log" id="log"></ul>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const ago = (t) => {
+    if (!t) return "";
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - t));
+    if (s < 60) return s + " 秒前";
+    if (s < 3600) return Math.floor(s / 60) + " 分钟前";
+    if (s < 86400) return Math.floor(s / 3600) + " 小时前";
+    return Math.floor(s / 86400) + " 天前";
+  };
+  function table(el, head, rows, empty) {
+    if (!rows.length) { el.innerHTML = '<tr><td class="empty">' + esc(empty) + '</td></tr>'; return; }
+    el.innerHTML = "<tr>" + head.map((h) => "<th>" + esc(h) + "</th>").join("") + "</tr>" + rows.join("");
+  }
+  const btn = (op, uid, label) => '<button data-op="' + op + '" data-uid="' + esc(uid) + '">' + esc(label) + "</button>";
+  let api = null;
+
+  function render(d) {
+    $("n-bots").textContent = (d.bots || []).length + (d.manual_bots || []).length;
+    $("n-brakes").textContent = (d.brakes || []).length;
+    $("n-judged").textContent = d.judged_today || 0;
+    $("n-humans").textContent = (d.humans || []).length;
+    table($("t-bots"), ["名字", "QQ", "为什么", "什么时候", ""],
+      (d.bots || []).map((b) => "<tr><td>" + esc(b.name) + "</td><td>" + esc(b.uid) + "</td><td>" + esc(b.why) +
+        (b.auto === false ? ' <span class="muted">（手动）</span>' : "") + "</td><td>" + ago(b.t) + "</td><td>" + btn("human", b.uid, "改成真人") + "</td></tr>")
+        .concat((d.manual_bots || []).map((u) => "<tr><td></td><td>" + esc(u) + '</td><td class="muted">配置里手动填的</td><td></td><td></td></tr>')),
+      "还没认出来。");
+    table($("t-verdicts"), ["名字", "QQ", "模型说", "把握", "行为分", "理由", "什么时候", ""],
+      (d.verdicts || []).map((v) => "<tr><td>" + esc(v.name) + "</td><td>" + esc(v.uid) + "</td><td>" +
+        (v.mixed ? '<span class="tag human">混用号</span>' : v.bot ? '<span class="tag ai">AI</span>' : '<span class="tag human">真人</span>') +
+        "</td><td>" + esc(v.conf) + "</td><td>" + esc(v.score) + "</td><td>" + esc(v.why) + "</td><td>" + ago(v.t) + "</td><td>" +
+        btn("bot", v.uid, "标成 AI") + btn("forget", v.uid, "清掉重看") + "</td></tr>"),
+      "还没让模型看过谁。");
+    table($("t-brakes"), ["QQ", "群", "还剩", ""],
+      (d.brakes || []).map((b) => "<tr><td>" + esc(b.uid) + "</td><td>" + esc(b.g) + "</td><td>" + Math.ceil(b.left / 60) + " 分钟</td><td>" +
+        btn("release", b.uid, "解除") + "</td></tr>"),
+      "现在没刹着谁。");
+    table($("t-humans"), ["名字", "QQ", "备注", ""],
+      (d.humans || []).map((h) => "<tr><td>" + esc(h.name) + "</td><td>" + esc(h.uid) + "</td><td>" + esc(h.note) + "</td><td>" +
+        btn("forget", h.uid, "移出（以后重新看）") + "</td></tr>"),
+      "没有。");
+    $("log").innerHTML = (d.events || []).map((e) => "<li><span class=\"muted\">" + ago(e.t) + "</span> " + esc(e.text) + "</li>").join("") ||
+      '<li class="muted">还没有。</li>';
+  }
+
+  async function load() {
+    try { render(await api.apiGet("state")); $("err").textContent = ""; }
+    catch (e) { $("err").textContent = "读不到插件状态：" + (e && e.message ? e.message : e); }
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button[data-op]");
+    if (!b || !api) return;
+    b.disabled = true;
+    try { render(await api.apiPost("action", { op: b.dataset.op, uid: b.dataset.uid })); }
+    catch (e) { $("err").textContent = "没改成：" + (e && e.message ? e.message : e); }
+    finally { b.disabled = false; }
+  });
+
+  async function start() {
+    for (let i = 0; i < 50 && !window.AstrBotPluginView; i++) await new Promise((r) => setTimeout(r, 100));
+    api = window.AstrBotPluginView;
+    if (!api) { $("err").textContent = "这个页面要在 AstrBot 的插件页面里打开。"; return; }
+    await api.ready();
+    await load();
+    setInterval(load, 15000);
+  }
+  window.addEventListener("load", start);
+})();
+</script>
+</body>
+</html>
