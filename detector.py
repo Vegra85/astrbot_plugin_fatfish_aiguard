@@ -11,6 +11,10 @@
   4. 模型说是 AI、把握 ≥ 75 → 标；把握 ≥ 65 而且行为分 ≥ 8 → 也标；混用号不标。
   5. 对聊刹车：我们的机器人回了某个人以后，他要是在机器人说完 20 秒内就接上（大模型生成要 10~20 秒）算一轮「秒接」；
      10 分钟里够 8 轮、而且行为像机器人（连发 / 自称 / 框架输出）→ 先停 10 分钟不回他，同时叫模型马上再看一眼。
+  6. 机器人们在回指令（v0.2.0，来自大肥鱼 10-30 的一次现场）：别家的机器人在群里发了一句「/stop」，
+     群里五个机器人同一秒回了同一句「管理命令仅管理员可用。」—— 大肥鱼以为大家在刷屏，跟着复读了一句。
+     现在：这句是机器人在回指令（命令 / 指令 / 权限 / 仅管理员 / No running tasks…）、框架报错、本身就是一条指令（/ # ! 开头），
+     或者离群里上一条指令不到 15 秒 → 算「回指令」：不算群里在刷、不跟、也不算成在跟我们的机器人聊天（不算秒接、不算 @ 它）。
 """
 
 import json
@@ -56,6 +60,17 @@ MARKUP = re.compile(
     re.I | re.M,
 )
 MEDIA = re.compile(r"\[(表情|图片|表情包|动画表情|视频|At:[^\]]*)[^\]]*\]")
+# 一条指令：/ # ! 开头（全角的也算）后面跟着字母或汉字；前面 @ 了谁不影响（「@某某 /stop」）
+CMD_START = re.compile(r"^\s*[/#＃!！]\s*[A-Za-z一-鿿]")
+LEAD_AT = re.compile(r"^(\s*@\S+)+\s*")
+# 机器人在回指令：没权限、仅管理员、没有在跑的任务、不认识的命令……（各家框架的说法不一样 只认这些常见的词）
+CMD_REPLY = re.compile(
+    r"命令|指令|权限|仅管理员|管理员可用|没有权限|无权|no running tasks|not authorized|permission|unknown command|"
+    r"/sid|/stop|/help|/reset|#sl\b",
+    re.IGNORECASE,
+)
+CMD_SEC = 15  # 群里有人发了指令以后这么多秒内的「齐刷刷」= 机器人们在回指令
+ECHO_SEC = 60  # 要发的话跟群里这么多秒内「回指令」的那句一模一样 = 在跟着复读
 
 BURST_GAP = 6  # 思考过程后面隔不到 6 秒连着发的 也算框架发的
 QUICK_SEC = 20  # 我们的机器人说完这么多秒内就接上 = 秒接
@@ -89,6 +104,25 @@ def is_fw(text):
     return bool(STRONG.search(text) or MARKUP.search(text))
 
 
+def is_cmd(text):
+    """这句本身是不是一条指令（/stop #sl ！签到 …）"""
+    return bool(CMD_START.match(LEAD_AT.sub("", str(text or ""))))
+
+
+def cmd_echo(text, since_cmd=999.0, window=CMD_SEC):
+    """这句是不是「机器人们在回指令」：回指令的话 / 框架报错 / 本身就是一条指令 / 离群里上一条指令不到 window 秒。
+    是 → 不算群里在刷、不跟着复读、不算成在跟我们的机器人聊天（v0.2.0）"""
+    t = str(text or "")
+    return bool(
+        CMD_REPLY.search(t) or is_fw(t) or is_cmd(t) or (0 <= since_cmd < window)
+    )
+
+
+def same(text):
+    """比较两句是不是同一句：去掉空白"""
+    return re.sub(r"\s+", "", str(text or ""))
+
+
 def flags(q):
     """每条是不是机器人框架的输出：报错 / 状态 / 标签、漏出来的思考过程，还有思考过程后面几秒内接着发的"""
     think = [bool(THINK.search(x[1])) for x in q]
@@ -104,16 +138,21 @@ def flags(q):
 class Detector:
     """一个 AstrBot 里一份。所有时间都从外面传进来（测试用假时钟）"""
 
-    def __init__(self, store=None, quick_sec=QUICK_SEC):
+    def __init__(self, store=None, quick_sec=QUICK_SEC, cmd_sec=CMD_SEC):
         self.msgs = defaultdict(
             lambda: deque(maxlen=40)
-        )  # (群, QQ) -> [(时间, 文字, 是不是冲着我们的机器人)]
+        )  # (群, QQ) -> [(时间, 文字, 是不是冲着我们的机器人, 是不是在回指令)]
         self.ours = defaultdict(
             lambda: deque(maxlen=60)
         )  # 群 -> [(时间, 我们的机器人说的)]
         self.asked = {}  # QQ -> (上次让模型看的时间, 那时的行为分)
         self.busy = set()
         self.quick_sec = float(quick_sec)
+        self.cmd_sec = float(cmd_sec)
+        self.last_cmd = {}  # 群 -> 群里上一条指令的时间
+        self.wave = defaultdict(
+            lambda: deque(maxlen=40)
+        )  # 群 -> [(时间, QQ, 去掉空白的字, 是不是在回指令)]：谁都记（真人、管理员、认出来的 AI）
         self.store = (
             store if isinstance(store, dict) else {}
         )  # 持久化的：verdicts / fw（按 QQ 号）
@@ -126,6 +165,32 @@ class Detector:
     def last_said(self, gk):
         q = self.ours.get(str(gk))
         return q[-1][0] if q else 0.0
+
+    def since_cmd(self, gk, now):
+        """离这个群上一条指令几秒（没有过 → 999）"""
+        t = self.last_cmd.get(str(gk))
+        return now - t if t is not None else 999.0
+
+    def heard(self, gk, uid, text, now, to_us=False):
+        """群里有人说了一句（谁都算，我们自己的机器人除外）→ 这句是不是「机器人们在回指令」（v0.2.0）。
+        冲着我们的机器人说的（@ / 引用）不看「指令后 15 秒」那条：那是在找我们 不是在跟着回别人的指令"""
+        gk, text = str(gk), str(text or "")
+        echo = cmd_echo(text, 999.0 if to_us else self.since_cmd(gk, now), self.cmd_sec)
+        if is_cmd(text):
+            self.last_cmd[gk] = now
+        self.wave[gk].append((now, str(uid), same(text), echo))
+        return echo
+
+    def echo_repeat(self, gk, text, now, win=ECHO_SEC):
+        """我们的机器人要发的这句，是不是在跟着群里「回指令」的那句复读：
+        win 秒内群里有人说过一模一样的，而且那句（或者这句本身）是回指令的话 → 是。普通的复读（大家刷「哈哈哈」）不管"""
+        s = same(text)
+        if not s:
+            return False
+        hits = [
+            x for x in self.wave.get(str(gk)) or [] if now - x[0] <= win and x[2] == s
+        ]
+        return bool(hits) and (any(x[3] for x in hits) or cmd_echo(text))
 
     def _note_fw(self, uid, gk, text, now):
         m = STRONG.search(text) or MARKUP.search(text)
@@ -142,7 +207,9 @@ class Detector:
         plain = [x for x, f in zip(q, fw) if not f]
         ts = [x[0] for x in q]
         hs = [t for t, _ in self.ours.get(str(gk)) or [] if now - t < win]
-        quick = sum(1 for h in hs if any(0 < t - h <= self.quick_sec for t in ts))
+        # 秒接只数他自己说的话：回指令的那几句不算（v0.2.0：我们的机器人回完指令 别家的机器人同一秒也回 —— 那不是在接我们的话）
+        tq = [x[0] for x in q if not (len(x) > 3 and x[3])]
+        quick = sum(1 for h in hs if any(0 < t - h <= self.quick_sec for t in tq))
         st = self.store["verdicts"].get(str(uid)) or {}
         # 连发：他自己两条之间不到 3.5 秒、而且中间我们的机器人没说话（一接就是两三条）；
         # 跟机器人你一句我一句聊得快的真人不算（机器人回得快的时候 他的两句也会挨得很近）
@@ -174,11 +241,12 @@ class Detector:
         )
         return ev
 
-    def observe(self, gk, uid, name, text, now, to_us=False):
-        """群里一条消息 → None / "check"（该让模型看看了）。不会一眼就标"""
+    def observe(self, gk, uid, name, text, now, to_us=False, echo=False):
+        """群里一条消息 → None / "check"（该让模型看看了）。不会一眼就标。
+        echo：这句是在回指令（heard 算的）→ 不算冲着我们的机器人、不算秒接"""
         text = str(text or "")
         q = self.msgs[(str(gk), str(uid))]
-        q.append((now, text, bool(to_us)))
+        q.append((now, text, bool(to_us) and not echo, bool(echo)))
         if is_fw(text):
             self._note_fw(uid, gk, text, now)
         items = [x for x in q if now - x[0] < 2 * 3600 and x[1]]
@@ -389,11 +457,12 @@ class Brake:
         self.until = {}  # (群, QQ) -> 刹到几点
         self.told = {}
 
-    def heard(self, gk, uid, now, last_ours):
-        """群里他说了一句（last_ours = 我们的机器人在这个群最后一次说话的时间）"""
+    def heard(self, gk, uid, now, last_ours, echo=False):
+        """群里他说了一句（last_ours = 我们的机器人在这个群最后一次说话的时间）。
+        echo：这句是在回指令（v0.2.0）→ 不算秒接"""
         self.fast_mark[(str(gk), str(uid))] = (
             now,
-            bool(last_ours) and now - last_ours <= self.fast,
+            not echo and bool(last_ours) and now - last_ours <= self.fast,
         )
 
     def braked(self, gk, uid, now):

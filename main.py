@@ -4,6 +4,7 @@
 
 不用填名单：群里别人部署的 AI 聊天机器人，它自己认出来；认出来以后只有 @ / 引用你的机器人才回，10 分钟最多回 3 次，
 不会被它拖进停不下来的对骂 / 互道晚安。还没认出来之前，对聊刹车兜底：来回太快太多、对方又像机器人 → 先停 10 分钟。
+别跟着机器人们回指令（v0.2.0）：有人发了「/stop」、几个机器人同一秒回「仅管理员可用」—— 不当成群里在刷、不跟、不当成在找你的机器人聊天。
 判断逻辑在 detector.py（不依赖 AstrBot，可以单独测）。
 """
 
@@ -20,7 +21,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 import astrbot.api.message_components as Comp
 
-from .detector import JUDGE, Brake, Detector
+from .detector import JUDGE, Brake, Detector, cmd_echo, is_cmd
 
 PLUGIN_NAME = "astrbot_plugin_fatfish_aiguard"
 TAG = "[认AI]"
@@ -50,6 +51,7 @@ class FatfishAIGuard(Star):
         self.det = Detector(
             self.state.setdefault("detector", {}),
             quick_sec=self._c("brake_fast_sec", 20),
+            cmd_sec=self._c("cmd_echo_sec", 15),
         )
         self.brake = Brake(
             self._c("brake_rounds", 8),
@@ -60,6 +62,7 @@ class FatfishAIGuard(Star):
         self.events = deque(self.state.get("events") or [], maxlen=200)
         self.allowed = {}  # (群, QQ) -> [我们回这个机器人的时间]
         self.judged_today = [time.strftime("%Y-%m-%d"), 0]
+        self._echo_log = {}  # (群, 哪种) -> 上次记日志的时间（回指令那一阵一秒好几条 日志别刷屏）
         self._dirty = False
         self._tasks = set()
         self._saver = None
@@ -68,6 +71,10 @@ class FatfishAIGuard(Star):
     # ───────── 配置 / 存档 ─────────
     def _c(self, key, default):
         return _num(self.config.get(key, default), default)
+
+    def _guard(self):
+        """别跟着机器人们回指令（v0.2.0）开着没有；老配置里没有这一项 = 开"""
+        return bool(self._c("cmd_echo_guard", True))
 
     def _load(self):
         try:
@@ -236,6 +243,52 @@ class FatfishAIGuard(Star):
         gs = self._cfg_list("groups")
         return bool(gs) and str(event.get_group_id()) not in gs
 
+    # ───────── 机器人们在回指令（v0.2.0） ─────────
+    def _is_echo(self, event, gk, uid, now):
+        """触发这次的那条消息是不是机器人们在回指令（on_group_message 算好放在 event 上；没算过就现算）"""
+        if not self._guard():
+            return False
+        v = event.get_extra("_fatfish_aiguard_echo")
+        if v is not None:
+            return bool(v)
+        return cmd_echo(
+            self._text(event), self.det.since_cmd(gk, now), self.det.cmd_sec
+        )
+
+    def _echo_note(self, gk, kind, text, event_text=""):
+        """回指令那一阵往往一秒好几条：同一个群同一种 60 秒只记一行日志；
+        给了 event_text 的（拦下了一句复读）10 分钟记一条进面板的「最近发生的事」"""
+        now = time.time()
+        if now - self._echo_log.get((gk, kind), 0) < 60:
+            return
+        self._echo_log[(gk, kind)] = now
+        if event_text and now - self._echo_log.get((gk, "event"), 0) >= 600:
+            self._echo_log[(gk, "event")] = now
+            self._event("echo", event_text, gk)
+        else:
+            logger.info(text)
+
+    @staticmethod
+    def _said(res):
+        try:
+            return "".join(
+                c.text for c in (res.chain if res else []) if isinstance(c, Comp.Plain)
+            )
+        except Exception:
+            return ""
+
+    def _cmd_reply(self, event, res, said):
+        """这次发出去的是不是在回指令（AstrBot 自带的 /stop /help、别的插件的指令）：
+        那不是你的机器人在聊天 → 不记成「你的机器人说了一句」、不数刹车轮数、不占认出来的 AI 的回复名额（v0.2.0）。
+        模型回的一律算聊天（哪怕那句是 / 开头叫醒的）"""
+        llm = getattr(res, "is_llm_result", None)
+        if callable(llm) and llm():
+            return False
+        # AstrBot 认出这是一条指令、交给了哪个插件
+        if event.get_extra("handlers_parsed_params"):
+            return True
+        return is_cmd(self._text(event)) or cmd_echo(said)
+
     # ───────── 每条群消息：记下来 看着像就让模型看 ─────────
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE, priority=sys.maxsize
@@ -245,13 +298,20 @@ class FatfishAIGuard(Star):
         if self._skip(event, uid):
             return
         gk, now = self._gk(event), time.time()
-        self.brake.heard(gk, uid, now, self.det.last_said(gk))
+        text = self._text(event)
+        wake = bool(getattr(event, "is_at_or_wake_command", False))
+        # 谁说的都要先过这一步（真人、管理员发的指令也算）：记下群里上一条指令的时间、这句是不是机器人们在回指令
+        echo = self.det.heard(gk, uid, text, now, to_us=wake) and self._guard()
+        # 后面 gate 要用：要不要拦 AstrBot 主动回复 / 别的插件接这句
+        event.set_extra("_fatfish_aiguard_echo", echo)
+        self.brake.heard(gk, uid, now, self.det.last_said(gk), echo=echo)
         if self.is_human(uid) or self.is_bot(uid):
             return
-        to_us = bool(getattr(event, "is_at_or_wake_command", False))
+        # 发指令 / 回指令不算「冲着我们的机器人聊天」（v0.2.0：以前「/stop」也算一次 @ 它）
+        to_us = wake and not echo
         name = event.get_sender_name() or uid
         if self.det.observe(
-            gk, uid, name, self._text(event), now, to_us
+            gk, uid, name, text, now, to_us, echo
         ) == "check" and self._c("enable_detect", True):
             self._spawn(self._check(gk, uid, name, event.unified_msg_origin))
 
@@ -261,10 +321,27 @@ class FatfishAIGuard(Star):
         if event.is_private_chat() or not event.get_group_id():
             return
         uid = str(event.get_sender_id())
-        if self._skip(event, uid) or self.is_human(uid):
+        if self._skip(event, uid):
             return
         gk, now = self._gk(event), time.time()
         name = event.get_sender_name() or uid
+        text = self._text(event)
+        if (
+            not getattr(event, "is_at_or_wake_command", False)
+            and self._is_echo(event, gk, uid, now)
+            and not is_cmd(text)
+        ):
+            # 没人找你的机器人、这句是机器人们在回指令 / 框架报错 / 指令后十几秒的齐刷刷：
+            # AstrBot 的主动回复、别的插件的接话都别接（v0.2.0）。谁说的都一样 —— 真人跟着刷也不接。
+            # 指令本身（「#菜单」这种没叫醒 AstrBot 的）不在这里拦：这里一拦整条消息就停了，
+            # 排在后面、本来要处理这条指令的插件也收不到 —— 指令怎么处理是 AstrBot 和别的插件的事
+            event.stop_event()
+            self._echo_note(
+                gk, "llm", f"{TAG} {name}({uid})「{text[:20]}」是在回指令 不接"
+            )
+            return
+        if self.is_human(uid):
+            return
         if self.is_bot(uid):
             if not getattr(event, "is_at_or_wake_command", False):
                 event.stop_event()  # 没 @ / 引用 —— 不主动接别人家 AI 的话
@@ -293,6 +370,30 @@ class FatfishAIGuard(Star):
                 f"{TAG_B} {name}({uid}) 找你的机器人 但刹车中（还有 {left} 分钟）不回"
             )
 
+    # ───────── 要发出去之前：别跟着机器人们回指令复读（v0.2.0） ─────────
+    @filter.on_decorating_result(priority=sys.maxsize)
+    async def no_echo_follow(self, event: AstrMessageEvent):
+        """别的复读插件 / 主动回复要发的这句，跟群里刚刚「回指令」的那句一模一样（大家同一秒回「仅管理员可用」）→ 不发。
+        只管没人找你的机器人时的；有人 @ / 引用 / 发指令时 AstrBot 和别的插件怎么回都不动"""
+        if event.is_private_chat() or not event.get_group_id() or not self._guard():
+            return
+        if getattr(event, "is_at_or_wake_command", False):
+            return
+        gs = self._cfg_list("groups")
+        if gs and str(event.get_group_id()) not in gs:
+            return
+        said = self._said(event.get_result())
+        gk, now = self._gk(event), time.time()
+        if not said.strip() or not self.det.echo_repeat(gk, said, now):
+            return
+        event.clear_result()  # 结果清空 = 这句不发（也不会触发 after_message_sent）
+        self._echo_note(
+            gk,
+            "repeat",
+            f"{TAG} 群里机器人们在回指令「{said[:20]}」→ 不跟着复读",
+            f"群 {gk.split(':', 1)[-1]} 机器人们在回指令「{said[:20]}」→ 没跟着复读（10 分钟只记一条）",
+        )
+
     # ───────── 回完一句：记下来、数来回的轮数 ─────────
     @filter.after_message_sent()
     async def after_sent(self, event: AstrMessageEvent):
@@ -300,13 +401,11 @@ class FatfishAIGuard(Star):
             return
         gk, now = self._gk(event), time.time()
         res = event.get_result()
-        said = ""
-        try:
-            said = "".join(
-                c.text for c in (res.chain if res else []) if isinstance(c, Comp.Plain)
-            )
-        except Exception:
-            said = ""
+        said = self._said(res)
+        if self._guard() and self._cmd_reply(event, res, said):
+            # 回的是指令：不算你的机器人在聊天（v0.2.0：以前「/stop」回一句「No running tasks」也记成说了一句 ——
+            # 别家的机器人同一秒回指令就被算成「秒接」；发指令的人也被多数了一轮来回）
+            return
         self.det.our_said(gk, now, said)
         uid = str(event.get_sender_id())
         if not self._skip(event, uid) and self.is_bot(
@@ -570,6 +669,8 @@ class FatfishAIGuard(Star):
                     "bot_reply_limit",
                     "bot_reply_window_sec",
                     "judge_threshold",
+                    "cmd_echo_guard",
+                    "cmd_echo_sec",
                 )
             },
         }

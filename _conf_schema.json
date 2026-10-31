@@ -72,6 +72,18 @@
     "type": "int",
     "default": 600
   },
+  "cmd_echo_guard": {
+    "description": "别跟着机器人们回指令",
+    "type": "bool",
+    "default": true,
+    "hint": "有人发了指令（/ # ! 开头），群里几个机器人同一秒回「仅管理员可用」「No running tasks」这类话、或者吐框架报错：不当成群里在刷屏，AstrBot 的主动回复和别的插件（复读、接话）都不跟；也不算成在找你的机器人聊天（不算秒接、不数刹车轮数）。你的机器人回指令也不算聊天。指令本身照常由 AstrBot 和别的插件处理。关掉 = 跟 v0.1.1 一样。"
+  },
+  "cmd_echo_sec": {
+    "description": "指令后多少秒内的齐刷刷算在回指令（秒）",
+    "type": "int",
+    "default": 15,
+    "hint": "群里有人发了指令以后这么多秒内、没 @ / 引用你的机器人的话，一律当成机器人们在回指令。"
+  },
   "never_bot": {
     "description": "永远当真人的 QQ 号",
     "type": "list",

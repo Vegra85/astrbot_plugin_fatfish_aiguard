@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-端到端测试：真的 AstrBot（4.29.3）+ 这个插件 + 假 QQ 端（假 NapCat 反向 WebSocket）+ 假模型（OpenAI 兼容）
+端到端测试：真的 AstrBot（测过 4.29.3、4.29.4）+ 这个插件 + 假 QQ 端（假 NapCat 反向 WebSocket）+ 假模型（OpenAI 兼容）
   A 真人老王连着 @ 机器人 12 次（每次隔几秒、一次一句）→ 每次都回、不刹、不叫模型看
   B 「隔壁的座头鲸」（自称本小姐、漏 <h> 标签、两条连发）：先在群里自己说几句 → 插件让模型看（假模型：AI 把握 72）→ 标上；
     之后它 @ 机器人 6 次 → 10 分钟里只回 3 次
   C 「小鲸」（假模型说像真人 55）：@ 机器人、机器人一说完 1 秒就接两条 → 第 8 轮刹住 → 后面不回
   D 管理员指令：/认ai 列表、/认ai 真人 <QQ>（改回真人以后座头鲸 @ 又会回了）；不是管理员 → 没权限
   E 面板接口：/api/v1/plugins/extensions/<插件>/state 能读到；/action 能改
+  G 机器人们在回指令（v0.2.0）：这个群开了 AstrBot 的主动回复（概率 1）、装了一个测试用的复读插件；
+    别家的机器人发「/stop」→ AstrBot 照常回指令；三个机器人同一秒回「管理命令仅管理员可用。」→ 不跟着复读、主动回复也不接；
+    过了 15 秒普通的话照常接；让模型看那几个号时：回指令的那句不算秒接、「/stop」不算 @ 它、AstrBot 回的指令不算机器人说的话
+  F 重启以后名单还在
 用法：python tests/e2e_astrbot.py [插件目录 默认上一层] [--keep]
-  需要装了 astrbot（测过 4.29.3）的 Python，astrbot 命令在 PATH 里；另外要 aiohttp、pyjwt、websockets（装 astrbot 时都会带上）
+  需要装了 astrbot（测过 4.29.3、4.29.4）的 Python，astrbot 命令在 PATH 里；另外要 aiohttp、pyjwt、websockets（装 astrbot 时都会带上）
   只在临时文件夹里跑：模型是假的、QQ 端是假的，不连外网
 """
 
@@ -37,7 +41,13 @@ PLUGIN_SRC = Path(
 KEEP = "--keep" in sys.argv
 PNAME = PLUGIN_SRC.name
 SELF, ADMIN, HUMAN, WHALE, KUN, OTHER = 99999, 10001, 30001, 40001, 40002, 50005
-G1, G2, G3 = 7001, 7002, 7003
+CMDBOT, BOT_A, BOT_B, BOT_C = (
+    60001,
+    60002,
+    60003,
+    60004,
+)  # G：发指令的、回指令的几个机器人（号都是编的）
+G1, G2, G3, G4 = 7001, 7002, 7003, 7004
 RES = []
 
 
@@ -50,6 +60,19 @@ def check(cond, msg, why=""):
         flush=True,
     )
     return bool(cond)
+
+
+def real_tracebacks(text):
+    """日志里的 Traceback，去掉 AstrBot 自带「主动回复」被别的插件拦下时它自己打的那段：
+    它的 on_message 用 except BaseException 把 GeneratorExit 也当成出错记了一笔（「主动回复失败」）。
+    v0.1.1 拦认出来的 AI 时就一样，只是以前的测试没开主动回复"""
+    out = []
+    for chunk in text.split("Traceback (most recent call last):")[1:]:
+        head = chunk[:1500]
+        if "GeneratorExit" in head and "主动回复失败" in head:
+            continue
+        out.append(chunk[:1200])
+    return out
 
 
 def free_port():
@@ -133,6 +156,10 @@ class FakeQQ:
             WHALE: "隔壁的座头鲸",
             KUN: "小鲸",
             OTHER: "路人",
+            CMDBOT: "阿甲",
+            BOT_A: "阿乙",
+            BOT_B: "阿丙",
+            BOT_C: "阿丁",
         }
         self.new_sent = asyncio.Event()
 
@@ -312,11 +339,56 @@ def setup_root():
         }
     ]
     cfg["admins_id"] = [str(ADMIN)]
+    # G：只有 G4 开 AstrBot 自带的主动回复（概率 1 = 每句没 @ 的都接），看插件拦不拦「回指令」的那几句
+    cfg["provider_ltm_settings"]["active_reply"] = {
+        "enable": True,
+        "method": "possibility_reply",
+        "possibility_reply": 1.0,
+        "whitelist": [str(G4)],
+    }
     cfg["platform_settings"]["rate_limit"]["count"] = 1000
     cfg.setdefault("dashboard", {})["port"] = DASH_PORT
     cfg["dashboard"]["host"] = "127.0.0.1"
     cfg["dashboard"]["jwt_secret"] = "e2e-secret-0123456789abcdef0123456789"
     p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    # G：一个测试用的复读插件（市场上常见的那种：群里连着三句一样、不止一个人说 → 跟一句；只在 G4）
+    rp = ROOT / "data" / "plugins" / "astrbot_plugin_e2e_repeat"
+    rp.mkdir(parents=True, exist_ok=True)
+    (rp / "metadata.yaml").write_text(
+        "name: astrbot_plugin_e2e_repeat\ndisplay_name: e2e 复读\ndesc: 测试用\n"
+        "version: v0.0.1\nauthor: e2e\nrepo: https://example.invalid/e2e\n",
+        encoding="utf-8",
+    )
+    (rp / "main.py").write_text(REPEAT_PLUGIN, encoding="utf-8")
+
+
+REPEAT_PLUGIN = f"""
+import sys
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+
+
+class E2ERepeat(Star):
+    def __init__(self, context: Context, config=None):
+        super().__init__(context)
+        self.last = []
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=sys.maxsize - 1)
+    async def on_msg(self, event: AstrMessageEvent):
+        if str(event.get_group_id()) != "{G4}":
+            return
+        t = (event.message_str or "").strip()
+        self.last = (self.last + [(str(event.get_sender_id()), t)])[-3:]
+        if t and len(self.last) == 3 and len({{x[1] for x in self.last}}) == 1 and len({{x[0] for x in self.last}}) >= 2:
+            self.last = []
+            yield event.plain_result(t)
+
+    # 关键词插件常见的写法：不用叫醒 AstrBot、优先级默认（排在 AstrBot 主动回复后面）
+    @filter.regex(r"^#签到$")
+    async def sign(self, event: AstrMessageEvent):
+        if str(event.get_group_id()) == "{G4}":
+            yield event.plain_result("签到成功（e2e）")
+"""
 
 
 async def main():
@@ -562,6 +634,96 @@ async def main():
         await qq.say(G3, KUN, "解除了吗", at_bot=True)
         check(bool(await qq.wait_reply(G3, t0)), "解除刹车以后它 @ 机器人又会回了")
 
+        # ═════════ G 机器人们在回指令 ═════════
+        print("\n[G 机器人们在回指令：不跟、不当成在找机器人聊（v0.2.0）]")
+        t0 = time.time()
+        await qq.say(G4, HUMAN, "大家晚上好", at_bot=True)
+        check(
+            bool(await qq.wait_reply(G4, t0)),
+            "（准备）真人 @ 机器人：回了（这个群有了对话 主动回复才接得上）",
+        )
+        await asyncio.sleep(1.5)
+        t0 = time.time()
+        await qq.say(G4, HUMAN, "今天天气还行")
+        check(
+            bool(await qq.wait_reply(G4, t0, timeout=8)),
+            "（对照）没 @ 的普通话：AstrBot 主动回复照常接",
+        )
+        await asyncio.sleep(2)
+        t0 = time.time()
+        await qq.say(G4, CMDBOT, "/stop")
+        got = await qq.wait_reply(G4, t0)
+        check(
+            got and "No running tasks" in got[0][1],
+            "别家的机器人发了 /stop：AstrBot 自己照常回指令（不拦）",
+            got,
+        )
+        await asyncio.sleep(0.3)
+        t1 = time.time()
+        for u in (BOT_A, BOT_B, BOT_C):
+            await qq.say(G4, u, "管理命令仅管理员可用。")
+            await asyncio.sleep(0.15)
+        await qq.say(
+            G4, BOT_A, "已经停下了"
+        )  # 没有「指令 / 权限」这些词 但在 /stop 后 15 秒内
+        got = await qq.wait_reply(G4, t1, timeout=8)
+        check(
+            not any("仅管理员" in x[1] for x in got),
+            "三个机器人同一秒回「管理命令仅管理员可用。」：没跟着复读（复读插件那句被拦下）",
+            got,
+        )
+        check(not got, "指令后 15 秒内这一阵：一句都没接（主动回复也不接）", got)
+        text = (ROOT / "astrbot_stdout.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        check(
+            "没跟着复读" in text and "是在回指令 不接" in text,
+            "日志写清楚了：复读那句是这个插件拦的、主动回复是这个插件拦的",
+        )
+        await asyncio.sleep(16)
+        t0 = time.time()
+        await qq.say(G4, HUMAN, "好了说正事 晚上吃啥")
+        check(
+            bool(await qq.wait_reply(G4, t0, timeout=8)),
+            "指令过去 15 秒以后：普通的话主动回复照常接（没拦过头）",
+        )
+        await asyncio.sleep(1.5)
+        t0 = time.time()
+        await qq.say(G4, HUMAN, "#签到")
+        got = await qq.wait_reply(G4, t0, timeout=8)
+        await asyncio.sleep(1.5)
+        got = [x for x in qq.sent if x[0] == G4 and x[2] >= t0]
+        check(
+            any("签到成功" in x[1] for x in got),
+            "没叫醒 AstrBot 的指令（#签到）：别的插件照常处理（插件不拦指令本身）",
+            got,
+        )
+        n0 = len(judge_calls)
+        t0 = time.time()
+        await qq.say(G4, ADMIN, f"/认ai 看看 {BOT_A}")
+        await qq.wait_reply(G4, t0, timeout=10)
+        t0 = time.time()
+        await qq.say(G4, ADMIN, f"/认ai 看看 {CMDBOT}")
+        await qq.wait_reply(G4, t0, timeout=10)
+        await asyncio.sleep(1)
+        ba = next((x for x in judge_calls[n0:] if f"账号名「{BOT_A}」" in x), "")
+        cb = next((x for x in judge_calls[n0:] if f"账号名「{CMDBOT}」" in x), "")
+        check(
+            "秒内就接上 0 次" in ba,
+            "让模型看回指令的机器人：机器人回完指令它同一秒也回 —— 不算秒接",
+            ba[-500:],
+        )
+        check(
+            ba and "No running tasks" not in ba and "No running tasks" not in cb,
+            "AstrBot 回的指令不算「你的机器人说的话」（来回里没有它）",
+            (ba[-600:], cb[-300:]),
+        )
+        check(
+            "@它 / 引用它 0 次" in cb,
+            "发「/stop」的那个号：发指令不算 @ 你的机器人聊天",
+            cb[-400:],
+        )
+
         state = (
             json.loads(
                 (ROOT / "data" / "plugin_data" / PNAME / "state.json").read_text(
@@ -585,10 +747,11 @@ async def main():
         text = (ROOT / "astrbot_stdout.log").read_text(
             encoding="utf-8", errors="replace"
         )
+        bad_tb = real_tracebacks(text)
         check(
-            "Traceback" not in text,
-            "整个过程 AstrBot 日志里没有 Traceback",
-            text[text.find("Traceback") - 300 :][:1500],
+            not bad_tb,
+            "整个过程 AstrBot 日志里没有 Traceback（AstrBot 主动回复被拦时它自己打的 GeneratorExit 不算）",
+            bad_tb[:1] or "",
         )
 
         print("\n[F 重启以后名单还在]")

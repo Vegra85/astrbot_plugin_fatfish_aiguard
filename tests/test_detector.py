@@ -157,6 +157,95 @@ check(
     B3.braked(G, W, t + 5) and not B3.braked(G, W, t + 700), "刹 10 分钟 之后自己放开"
 )
 
+print("\n[5 机器人们在回指令：不算在刷、不跟、不算在跟机器人聊（v0.2.0）]")
+# 现场（编的号）：别家的机器人发了「/stop」，几个机器人同一秒回「管理命令仅管理员可用。」
+ce = getattr(det, "cmd_echo", None)
+check(
+    ce is not None
+    and ce("管理命令仅管理员可用。")
+    and ce("✅ No running tasks in the current session.")
+    and ce("您的权限不足以使用此指令。")
+    and ce("LLM 请求失败")
+    and ce("/stop")
+    and ce("＃状态")
+    and ce("@10086 /stop"),
+    "回指令的话 / 框架报错 / 指令本身 都算",
+)
+check(
+    ce is not None
+    and not ce("今天吃啥")
+    and not ce("1/2 是多少")
+    and ce("好的已停止", 3)
+    and not ce("好的已停止", 20),
+    "普通的话不算；离上一条指令不到 15 秒的才算",
+)
+
+
+def _try(o, name, *a, **k):
+    try:
+        return getattr(o, name)(*a, **k)
+    except (
+        AttributeError,
+        TypeError,
+    ) as e:  # 老代码没有这些接口 / 参数：算没过 不让整个测试崩
+        return e
+
+
+G5 = "qq:5"
+D5 = det.Detector()
+t = 20000.0
+r = [
+    _try(D5, "heard", G5, "60001", "/stop", t, to_us=True),
+    _try(D5, "heard", G5, "60002", "好的已停止", t + 1),
+    _try(D5, "heard", G5, "30001", "@99999 你好呀", t + 2, to_us=True),
+    _try(D5, "heard", G5, "30002", "晚上吃啥", t + 20),
+]
+check(
+    r == [True, True, False, False],
+    "heard：指令本身 / 指令后 15 秒的齐刷刷算；@ 机器人的、过了 15 秒的不算",
+    r,
+)
+for i, u in enumerate(("60003", "60004", "60005")):
+    _try(D5, "heard", G5, u, "管理命令仅管理员可用。", t + 30 + i * 0.2)
+    _try(D5, "heard", G5, f"3000{i + 3}", "哈哈哈哈", t + 31 + i * 0.2)
+r = [
+    _try(D5, "echo_repeat", G5, "管理命令仅管理员可用。", t + 32),
+    _try(D5, "echo_repeat", G5, "管理命令 仅管理员可用。", t + 32),
+    _try(D5, "echo_repeat", G5, "哈哈哈哈", t + 32),
+    _try(D5, "echo_repeat", G5, "权限不够呀", t + 32),
+    _try(D5, "echo_repeat", G5, "管理命令仅管理员可用。", t + 200),
+]
+check(
+    r == [True, True, False, False, False],
+    "要发的话跟群里刚回指令的那句一样 → 是跟着复读；普通复读（哈哈哈哈）、没人说过的、一分钟前的 不算",
+    r,
+)
+
+# 我们的机器人刚说完一句（模型回的）→ 别家机器人 1 秒后回指令：不算秒接、不算冲着我们的机器人
+D6 = det.Detector()
+t = 30000.0
+D6.our_said(G5, t, "收到")
+echo = _try(D6, "heard", G5, "60003", "管理命令仅管理员可用。", t + 1)
+_try(
+    D6, "observe", G5, "60003", "某机器人", "管理命令仅管理员可用。", t + 1, True, echo
+)
+ev = D6.evidence(G5, "60003", t + 2)
+check(
+    echo is True and ev["quick"] == 0 and ev["to_us"] == 0,
+    "回指令的那句：不算秒接、不算 @ 它",
+    (echo, ev),
+)
+D6.our_said(G5, t + 40, "嗯嗯")
+D6.observe(G5, "60003", "某机器人", "那你说说", t + 41, True)
+check(D6.evidence(G5, "60003", t + 42)["quick"] == 1, "平常的秒接照样算")
+B6 = det.Brake()
+_try(B6, "heard", G5, "60003", t + 1, t, echo=True)
+check(
+    not (B6.fast_mark.get((G5, "60003")) or (0, True))[1],
+    "刹车：回指令的那句不算一轮秒接",
+    B6.fast_mark,
+)
+
 ok = sum(1 for c, _ in RES if c)
 bad = [m for c, m in RES if not c]
 print(
