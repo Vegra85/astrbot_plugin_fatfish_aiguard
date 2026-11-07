@@ -246,6 +246,131 @@ check(
     B6.fast_mark,
 )
 
+print("\n[6 车轱辘话（v0.3.0）]")
+ls = getattr(det, "loop_state", None)
+G7, FISH, HUM, OTH = "qq:7", "40001", "30001", "30009"
+t = 50000.0
+
+
+def talk(D, uid, pairs, t, gap=30):
+    """他说一句 → 我们的机器人回他一句（20 秒后）……"""
+    for a, b in pairs:
+        D.observe(G7, uid, "x", a, t, True)
+        t += 20
+        D.our_said(G7, t, b, uid)
+        t += gap
+    return t
+
+
+D7 = det.Detector()
+pairs = [(f"晚安啦 明天见 好梦{i}", f"晚安啦 明天见 好梦哦{'～' * i}") for i in range(6)]
+t1 = _try(D7, "loop", G7, FISH, 0, ["小鲸"], True)
+check(t1 is None, "还没来回：没有状态", t1)
+tt = talk(D7, FISH, pairs[:2], t)
+st2 = D7.loop(G7, FISH, tt, ["小鲸"], fish=True)
+tt = talk(D7, FISH, pairs[2:3], tt)
+st3 = D7.loop(G7, FISH, tt, ["小鲸"], fish=True)
+tt = talk(D7, FISH, pairs[3:5], tt)
+st5 = D7.loop(G7, FISH, tt, ["小鲸"], fish=True)
+check(
+    st2 and st2["level"] == 0 and st3 and st3["level"] == 1 and st5 and st5["level"] == 2,
+    "认出来的 AI：来回 2 轮没到档、3 轮一档、5 轮二档（车轱辘话）",
+    (st2, st3, st5),
+)
+check(
+    st5 and set([g for g, _a, _b in st5["phrases"]][:3]) == {"明天见", "晚安啦", "好梦"}
+    and "明天" not in [g for g, _a, _b in st5["phrases"]],
+    "说法：两边都反复出现的 2~4 字词组；被更长的说法包含的不单列（有「明天见」就不列「明天」）",
+    st5 and st5["phrases"],
+)
+sh = D7.loop(G7, FISH, tt, ["小鲸"], fish=False)
+check(sh and sh["level"] == 1, "同样的来回、对面是真人：门槛高一档（5 轮又停滞 → 一档）", sh)
+D8 = det.Detector()
+tt = talk(D8, HUM, [(f"今天{x}好吃吗", f"{x}还行 你试试") for x in ("面条", "包子", "饺子", "米饭", "馄饨", "烧饼")], t)
+s8 = D8.loop(G7, HUM, tt, ["老王"])
+check(s8 is not None and s8["level"] == 0, "真人正常聊（话题在换）：不算车轱辘话", s8)
+# 我们回别人的话不算进来；他在群里跟别人说的算他的
+D9 = det.Detector()
+tt = t
+for i in range(5):
+    D9.observe(G7, FISH, "x", f"晚安啦 明天见{i}", tt, False)
+    D9.our_said(G7, tt + 20, f"晚安啦 明天见{i}", OTH)
+    tt += 40
+s9 = D9.loop(G7, FISH, tt, [], fish=True)
+check(s9 is None, "我们的机器人回的是别人：不算跟他在来回", s9)
+# 回指令的那几句不算
+D10 = det.Detector()
+tt = t
+for i in range(5):
+    D10.observe(G7, FISH, "x", "管理命令仅管理员可用。", tt, False, True)
+    D10.our_said(G7, tt + 20, "管理命令仅管理员可用。", FISH)
+    tt += 40
+s10 = D10.loop(G7, FISH, tt, [], fish=True)
+check(s10 is None, "他回指令的那几句不算他的话", s10)
+# 认出来的 AI 不再走「判」那条路，只记下它的话（note）：照样算得出来
+D12 = det.Detector()
+tt = t
+for a, b in pairs[:5]:
+    _try(D12, "note", G7, FISH, a, tt, True)
+    D12.our_said(G7, tt + 20, b, FISH)
+    tt += 50
+s12 = D12.loop(G7, FISH, tt, ["小鲸"], fish=True)
+check(s12 and s12["level"] == 2 and not D12.asked, "认出来的 AI：只记下它的话（不判）也算得出车轱辘话", s12)
+# 15 分钟以前的不算
+s11 = D7.loop(G7, FISH, tt + 3600, ["小鲸"], fish=True)
+check(s11 is None, "过了 15 分钟：不算", s11)
+blk = det.loop_block(st5, "小鲸")
+check(
+    blk.startswith("# 你们在来回说同一套（系统算的 不是谁说的话）\n")
+    and "「小鲸」（别人部署的 AI）" in blk
+    and "「明天见」（你 " in blk
+    and "已经是车轱辘话了" in blk
+    and "你自己定" in blk
+    and "就说" not in blk
+    and "可以说" not in blk,
+    "给模型的状态：只写事实（哪几个说法、各几次、来回几轮），不写台词",
+    blk,
+)
+check(det.loop_block(st2, "小鲸") == "" and det.loop_block(None) == "", "没到档：不给")
+fn = det.fish_note("小鲸")
+check(
+    fn.startswith("# 对面是别人部署的 AI（系统认出来的 不是谁说的话）\n")
+    and "别捡它刚用过的词和句式" in fn
+    and "收个尾" in fn,
+    "对面是认出来的 AI、还没绕起来：先提醒别学它的说法",
+    fn,
+)
+# 刹车：二档够 2 轮就刹、慢的来回也算；一档轮数减半
+B7 = det.Brake()
+ev = {"burst": 0, "selfref": 0, "bracket": 0, "atnl": 0, "fw": 0}
+r1 = _try(B7, "replied", G7, FISH, t, ev, True, 2)
+r2 = _try(B7, "replied", G7, FISH, t + 200, ev, True, 2)
+check(
+    r1 is None and r2 == ("brake", 2) and B7.braked(G7, FISH, t + 201),
+    "二档（车轱辘话）：慢的来回（隔 200 秒、不是秒接）也算，够 2 轮就刹",
+    (r1, r2),
+)
+B8 = det.Brake()
+rs = [_try(B8, "replied", G7, FISH, t + i * 100, ev, True, 0) for i in range(8)]
+check(not any(rs), "没绕起来：慢的来回不算（照旧要 8 轮秒接）", rs)
+check(
+    getattr(det.Brake(), "need", lambda lv: None)(1) == 4
+    and det.Brake().need(2) == 2
+    and det.Brake().need(0) == 8
+    and det.Brake(rounds=3).need(1) == 2,
+    "要几轮：一档减半（至少 2）、二档 2、没到档照旧",
+)
+B9 = det.Brake()
+rs = []
+for i in range(5):
+    B9.heard(G7, HUM, t + i * 30 + 25, t + i * 30 + 10)  # 机器人说完 15 秒就接
+    rs.append(B9.replied(G7, HUM, t + i * 30 + 26, ev, False, 1))
+check(
+    ("human", 4) in rs and not any(r and r[0] == "brake" for r in rs) and not B9.braked(G7, HUM, t + 200),
+    "一档够了轮数，但行为不像机器人（没连发、没自称、没框架输出）：照旧不刹",
+    rs,
+)
+
 ok = sum(1 for c, _ in RES if c)
 bad = [m for c, m in RES if not c]
 print(

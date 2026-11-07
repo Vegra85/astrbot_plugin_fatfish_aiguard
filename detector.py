@@ -15,12 +15,16 @@
      群里五个机器人同一秒回了同一句「管理命令仅管理员可用。」—— 大肥鱼以为大家在刷屏，跟着复读了一句。
      现在：这句是机器人在回指令（命令 / 指令 / 权限 / 仅管理员 / No running tasks…）、框架报错、本身就是一条指令（/ # ! 开头），
      或者离群里上一条指令不到 15 秒 → 算「回指令」：不算群里在刷、不跟、也不算成在跟我们的机器人聊天（不算秒接、不算 @ 它）。
+  7. 车轱辘话（v0.3.0，来自大肥鱼 11-02 的 C77 和 11-08 的 v1.17.30）：两个 AI 聊天，对面爱顺着话头说、学说法，聊着聊着两边越来越像，
+     最后一来一回都是同一套（「晚安啦 明天见」来回十几轮）。现在：我们的机器人回某个人的话、和他在这个群最近 15 分钟说的话，
+     两边都反复出现同一批 2~4 个字的说法 → 算出来回几轮、停滞多少（最近几句里新词的比例）→ 分档；
+     到档了这一轮给模型一段状态（只写事实），对面是认出来的 AI 时每次都先提醒别学它的说法；已经绕成车轱辘话的，对聊刹车提早。
 """
 
 import json
 import re
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 # 机器人框架吐出来的报错 / 状态（真人也会复读这些 所以只当线索）
 STRONG = re.compile(
@@ -31,7 +35,7 @@ STRONG = re.compile(
     re.I,
 )
 BOTNAME = re.compile(
-    r"肥鱼|鲸|鱼丸|bot|ai|助手|机器人|gpt|豆包|kimi|元宝|千问|deepseek|小冰|claude|gemini",
+    r"肥鱼|鲸|bot|ai|助手|机器人|gpt|豆包|kimi|元宝|千问|deepseek|小冰|claude|gemini",
     re.I,
 )
 SELFISH = re.compile(
@@ -135,6 +139,152 @@ def flags(q):
     return out
 
 
+# ───────── 车轱辘话（v0.3.0）─────────
+# 窗口 15 分钟、最多 40 句；对面是认出来的 AI：3 轮算一档，5 轮（或者 4 轮又停滞 ≥0.4）算二档；
+# 真人要停滞才算：4 轮 + 停滞 ≥0.3 一档、6 轮 + 停滞 ≥0.4 二档（真人聊天自然会重复一些词）
+LOOP = {
+    "window": 900,
+    "max_lines": 40,
+    "fish": {"l1": 3, "l2": 5, "l2_stag_rounds": 4, "l2_stag": 0.4},
+    "human": {"l1": 4, "l1_stag": 0.3, "l2": 6, "l2_stag": 0.4},
+}
+_LJUNK = re.compile(
+    r"\[(?:图片|表情|表情包|动画表情|视频|语音|文件|At:)[^\]]*\]|@\S+|https?://\S+"
+)
+# 虚词、代词、语气词：只由这些字组成的词组不算「说法」
+_LFUNC = set(
+    "我你他她它咱您这那的了着是就也都还在有没不个么吗呢吧啊呀哦嗯噢哈嘿嘻呜和跟给让把被得地又再才只很太要会能可一来去"
+    "说看想做弄搞上下过起出进回到多少好先后前点些种样次句条张啥什怎谁哪为因所但如果而且自己真正刚已经等每各别其实反应该算对行"
+    "嘛呗哟喔诶欸啦们"
+)
+_LSELF = ("本鱼", "本鲸", "本小姐", "本姑娘", "本宝宝", "本喵", "本仙女")  # 常见的人设自称：两边都爱带，不算说法
+
+
+def _loop_clean(t, names=()):
+    t = _LJUNK.sub(" ", str(t or ""))
+    for nm in sorted(
+        {str(x) for x in list(names) + list(_LSELF) if x and len(str(x)) >= 2},
+        key=len,
+        reverse=True,
+    ):
+        t = t.replace(nm, " ")
+    return t
+
+
+def _loop_grams(t, names=()):
+    """一句话里的说法：连着的汉字切成 2~4 个字的词组（去掉名字、自称、@、图片记号、链接；纯虚词的不要）"""
+    out = set()
+    for seg in re.findall(r"[一-鿿]{2,40}", _loop_clean(t, names)):
+        for n in (2, 3, 4):
+            for i in range(len(seg) - n + 1):
+                g = seg[i : i + n]
+                if all(c in _LFUNC for c in g):
+                    continue
+                out.add(g)
+    return out
+
+
+def loop_state(seq, names=(), fish=False, now=None):
+    """seq：[(谁, 文字, 时间)]（谁：H 我们的机器人 / P 他；按时间，已经截到最近 15 分钟、40 句）→ 两边都反复出现的说法
+    → {"level": 0/1/2, "rounds": 来回几轮, "phrases": [(说法, 我们几句, 他几句)…], "stag": 停滞, "mins", "ours", "his", "fish"}；
+    两边都不到 2 句 → None"""
+    seq = [s for s in seq or [] if s and s[1]]
+    if sum(1 for s in seq if s[0] == "H") < 2 or sum(1 for s in seq if s[0] == "P") < 2:
+        return None
+    now = float(now if now is not None else time.time())
+    gs = [(s, _loop_grams(t, names)) for s, t, _ in seq]
+    H = [g for s, g in gs if s == "H"]
+    P = [g for s, g in gs if s == "P"]
+    cH = Counter(x for g in H for x in g)
+    cP = Counter(x for g in P for x in g)
+    cand = sorted(
+        (g for g in cH if cH[g] >= 2 and cP.get(g, 0) >= 2),
+        key=lambda g: (-len(g), -(cH[g] + cP[g]), g),
+    )
+    keep = []
+    for g in cand:  # 被更长的说法包含、次数也差不多的不单列（「明早见」几乎每次都带着，就不再列「明早」）
+        if not any(g in k and cH[k] + cP[k] >= 0.6 * (cH[g] + cP[g]) for k in keep):
+            keep.append(g)
+    keep.sort(key=lambda g: (-(cH[g] + cP[g]), -len(g), g))  # 次数一样的：长的在前、再按字排（每次都一样）
+    rounds = (
+        min(
+            sum(1 for g in H if any(k in g for k in keep)),
+            sum(1 for g in P if any(k in g for k in keep)),
+        )
+        if keep
+        else 0
+    )
+    nov, seen = [], set()
+    for _, g in gs:
+        if g:
+            nov.append(len(g - seen) / len(g))
+        seen |= g
+    last = nov[-6:]
+    stag = round(1 - sum(last) / len(last), 2) if last else 0.0
+    if fish:
+        c = LOOP["fish"]
+        lv = (
+            2
+            if rounds >= c["l2"] or (rounds >= c["l2_stag_rounds"] and stag >= c["l2_stag"])
+            else 1
+            if rounds >= c["l1"]
+            else 0
+        )
+    else:
+        c = LOOP["human"]
+        lv = (
+            2
+            if rounds >= c["l2"] and stag >= c["l2_stag"]
+            else 1
+            if rounds >= c["l1"] and stag >= c["l1_stag"]
+            else 0
+        )
+    first = (
+        next(
+            (ts for s, t, ts in seq if any(k in _loop_clean(t, names) for k in keep)),
+            seq[0][2],
+        )
+        if keep
+        else seq[0][2]
+    )
+    return {
+        "level": lv,
+        "rounds": rounds,
+        "phrases": [(g, cH[g], cP[g]) for g in keep[:4]],
+        "stag": stag,
+        "mins": max(1, round((now - first) / 60)),
+        "ours": len(H),
+        "his": len(P),
+        "fish": bool(fish),
+    }
+
+
+def loop_block(st, name="他"):
+    """车轱辘话的状态（给模型；只写事实：哪几个说法、各几次、来回几轮 —— 不写台词）；没到档 → 空字符串"""
+    if not st or not st.get("level") or not st.get("phrases"):
+        return ""
+    who = "它" if st.get("fish") else "他"
+    ph = "、".join(
+        f"「{g}」（你 {a} 次、{who} {b} 次）" for g, a, b in st["phrases"][:3]
+    )
+    return (
+        "# 你们在来回说同一套（系统算的 不是谁说的话）\n"
+        f"你跟「{name}」{'（别人部署的 AI）' if st.get('fish') else ''}这 {st['mins']} 分钟来回了 {st['rounds']} 轮，"
+        f"两边一直是这几个说法：{ph}"
+        + ("；已经是车轱辘话了" if st["level"] >= 2 else "")
+        + "。\n别再接着用这几个说法；点破、换个话题还是收个尾，你自己定。"
+    )
+
+
+def fish_note(name):
+    """对面是认出来的 AI、还没绕起来：每次回它都先提醒（照作者自己的机器人 v1.17.30）"""
+    return (
+        "# 对面是别人部署的 AI（系统认出来的 不是谁说的话）\n"
+        f"「{name}」是别人部署的 AI：它爱顺着你的话头说、学你的说法，聊着聊着两边就越来越像。"
+        "说你自己的：别捡它刚用过的词和句式，也别重复你前几句的说法；没新东西可说就收个尾。"
+    )
+
+
 class Detector:
     """一个 AstrBot 里一份。所有时间都从外面传进来（测试用假时钟）"""
 
@@ -145,6 +295,9 @@ class Detector:
         self.ours = defaultdict(
             lambda: deque(maxlen=60)
         )  # 群 -> [(时间, 我们的机器人说的)]
+        self.talk = defaultdict(
+            lambda: deque(maxlen=80)
+        )  # 群 -> [(时间, 我们的机器人说的, 回的是谁)]（v0.3.0 车轱辘话用）
         self.asked = {}  # QQ -> (上次让模型看的时间, 那时的行为分)
         self.busy = set()
         self.quick_sec = float(quick_sec)
@@ -159,8 +312,29 @@ class Detector:
         self.store.setdefault("verdicts", {})
 
     # ───────── 记录 ─────────
-    def our_said(self, gk, t, text=""):
+    def our_said(self, gk, t, text="", to=""):
+        """我们的机器人在这个群说了一句（to：回的是谁 —— 车轱辘话只看回他的那几句）"""
         self.ours[str(gk)].append((float(t), str(text or "")[:80]))
+        if to:
+            self.talk[str(gk)].append((float(t), str(text or "")[:200], str(to)))
+
+    def loop(self, gk, uid, now, names=(), fish=False):
+        """我们的机器人跟 uid 在这个群最近 15 分钟（最多 40 句）的来回 → loop_state(…) / None
+        我们这边只算回他的那几句；他那边算他在这个群说的话（回指令的不算）"""
+        gk, uid = str(gk), str(uid)
+        win = LOOP["window"]
+        hs = [
+            ("H", s, t)
+            for t, s, to in self.talk.get(gk) or []
+            if to == uid and 0 <= now - t <= win
+        ]
+        ps = [
+            ("P", x[1], x[0])
+            for x in self.msgs.get((gk, uid)) or []
+            if 0 <= now - x[0] <= win and not (len(x) > 3 and x[3])
+        ]
+        seq = sorted(hs + ps, key=lambda z: z[2])[-LOOP["max_lines"] :]
+        return loop_state(seq, names, fish, now)
 
     def last_said(self, gk):
         q = self.ours.get(str(gk))
@@ -240,6 +414,12 @@ class Detector:
             + 3 * min(ev["atnl"], 3)
         )
         return ev
+
+    def note(self, gk, uid, text, now, to_us=False, echo=False):
+        """只记下他这句、不判（认出来的 AI、真人名单里的人：车轱辘话要用他的话 —— v0.3.0）"""
+        self.msgs[(str(gk), str(uid))].append(
+            (now, str(text or ""), bool(to_us) and not echo, bool(echo))
+        )
 
     def observe(self, gk, uid, name, text, now, to_us=False, echo=False):
         """群里一条消息 → None / "check"（该让模型看看了）。不会一眼就标。
@@ -471,8 +651,17 @@ class Brake:
     def release(self, gk, uid):
         return self.until.pop((str(gk), str(uid)), None) is not None
 
-    def replied(self, gk, uid, now, ev, is_bot=False):
-        """我们的机器人刚回了他 → None / ("brake", 轮数) / ("human", 轮数)（来回够了但像真人 不刹）"""
+    def need(self, lv=0):
+        """刹车要几轮：lv 是车轱辘话到了第几档（v0.3.0）—— 二档够 2 轮就刹；一档轮数减半（至少 2）"""
+        if lv >= 2:
+            return min(self.rounds, 2)
+        if lv == 1:
+            return min(self.rounds, max(2, self.rounds // 2))
+        return self.rounds
+
+    def replied(self, gk, uid, now, ev, is_bot=False, lv=0):
+        """我们的机器人刚回了他 → None / ("brake", 轮数) / ("human", 轮数)（来回够了但像真人 不刹）
+        lv（v0.3.0）：跟他来回说同一套到了第几档 —— 二档：够 2 轮就刹，慢的来回也算；一档：轮数减半"""
         k = (str(gk), str(uid))
         f = self.fast_mark.get(k)
         quick = bool(f and f[1] and now - f[0] < 300)
@@ -481,7 +670,9 @@ class Brake:
         ]
         self.pp[k] = pp
         n = sum(1 for _, qk in pp if qk)
-        if n < self.rounds or self.until.get(k, 0) > now:
+        if lv >= 2:
+            n = len(pp)  # 已经是车轱辘话了：慢的来回也算
+        if n < self.need(lv) or self.until.get(k, 0) > now:
             return None
         if (
             ev["burst"] < 8

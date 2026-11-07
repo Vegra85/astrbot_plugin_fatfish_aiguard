@@ -5,6 +5,7 @@
 不用填名单：群里别人部署的 AI 聊天机器人，它自己认出来；认出来以后只有 @ / 引用你的机器人才回，10 分钟最多回 3 次，
 不会被它拖进停不下来的对骂 / 互道晚安。还没认出来之前，对聊刹车兜底：来回太快太多、对方又像机器人 → 先停 10 分钟。
 别跟着机器人们回指令（v0.2.0）：有人发了「/stop」、几个机器人同一秒回「仅管理员可用」—— 不当成群里在刷、不跟、不当成在找你的机器人聊天。
+车轱辘话（v0.3.0）：你的机器人跟同一个人来回说同一套 → 这一轮给模型状态；对面是认出来的 AI → 先提醒别学它的说法；绕成车轱辘话了 → 刹车提早。
 判断逻辑在 detector.py（不依赖 AstrBot，可以单独测）。
 """
 
@@ -18,10 +19,24 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 import astrbot.api.message_components as Comp
 
-from .detector import JUDGE, Brake, Detector, cmd_echo, is_cmd
+try:  # 加给模型的那段状态（这一轮临时的，不进聊天记录）；老版本没有 → 不加
+    from astrbot.core.agent.message import TextPart
+except Exception:  # pragma: no cover
+    TextPart = None
+
+from .detector import (
+    JUDGE,
+    Brake,
+    Detector,
+    cmd_echo,
+    fish_note,
+    is_cmd,
+    loop_block,
+)
 
 PLUGIN_NAME = "astrbot_plugin_fatfish_aiguard"
 TAG = "[认AI]"
@@ -63,6 +78,7 @@ class FatfishAIGuard(Star):
         self.allowed = {}  # (群, QQ) -> [我们回这个机器人的时间]
         self.judged_today = [time.strftime("%Y-%m-%d"), 0]
         self._echo_log = {}  # (群, 哪种) -> 上次记日志的时间（回指令那一阵一秒好几条 日志别刷屏）
+        self._loop_log = {}  # (群, QQ, 档) -> 上次记日志的时间（v0.3.0 车轱辘话）
         self._dirty = False
         self._tasks = set()
         self._saver = None
@@ -75,6 +91,10 @@ class FatfishAIGuard(Star):
     def _guard(self):
         """别跟着机器人们回指令（v0.2.0）开着没有；老配置里没有这一项 = 开"""
         return bool(self._c("cmd_echo_guard", True))
+
+    def _loop_on(self):
+        """车轱辘话（v0.3.0）开着没有；老配置里没有这一项 = 开"""
+        return bool(self._c("loop_enable", True))
 
     def _load(self):
         try:
@@ -306,6 +326,8 @@ class FatfishAIGuard(Star):
         event.set_extra("_fatfish_aiguard_echo", echo)
         self.brake.heard(gk, uid, now, self.det.last_said(gk), echo=echo)
         if self.is_human(uid) or self.is_bot(uid):
+            # 不用再判，但记下这句：车轱辘话要看他说了什么（v0.3.0）
+            self.det.note(gk, uid, text, now, to_us=wake and not echo, echo=echo)
             return
         # 发指令 / 回指令不算「冲着我们的机器人聊天」（v0.2.0：以前「/stop」也算一次 @ 它）
         to_us = wake and not echo
@@ -353,6 +375,13 @@ class FatfishAIGuard(Star):
                 self._c("bot_reply_window_sec", 600),
                 self._c("bot_reply_limit", 3),
             )
+            if self._c("brake_enable", True) and self.brake.braked(gk, uid, now):
+                event.stop_event()  # v0.3.0：跟它来回说同一套、刹车提早刹住了
+                left = int((self.brake.until[(gk, uid)] - now) // 60) + 1
+                logger.info(
+                    f"{TAG_B} {name}({uid}) 是别人家的 AI，跟你的机器人绕成车轱辘话刹住了（还有 {left} 分钟）不回"
+                )
+                return
             q = [t for t in self.allowed.get((gk, uid), []) if now - t < win]
             self.allowed[(gk, uid)] = q
             if len(q) >= lim:
@@ -406,14 +435,16 @@ class FatfishAIGuard(Star):
             # 回的是指令：不算你的机器人在聊天（v0.2.0：以前「/stop」回一句「No running tasks」也记成说了一句 ——
             # 别家的机器人同一秒回指令就被算成「秒接」；发指令的人也被多数了一轮来回）
             return
-        self.det.our_said(gk, now, said)
         uid = str(event.get_sender_id())
+        # 回的是谁也记上（v0.3.0：车轱辘话只看回他的那几句）
+        self.det.our_said(gk, now, said, "" if self._skip(event, uid) else uid)
         if not self._skip(event, uid) and self.is_bot(
             uid
         ):  # 回了别人家的 AI 一次：记进「10 分钟最多 3 次」（v0.1.1）
             win = self._c("bot_reply_window_sec", 600)
             q = [t for t in self.allowed.get((gk, uid), []) if now - t < win]
             self.allowed[(gk, uid)] = q + [now]
+            self._loop_brake(event, gk, uid, now)
             return
         if (
             self._skip(event, uid)
@@ -445,6 +476,76 @@ class FatfishAIGuard(Star):
             self._spawn(
                 self._check(gk, uid, name, event.unified_msg_origin, force=True)
             )
+
+    def _loop_brake(self, event, gk, uid, now):
+        """回了认出来的 AI 一次（v0.3.0）：跟它来回说同一套了 → 对聊刹车提早（二档够 2 轮就刹、慢的来回也算；一档轮数减半）。
+        没绕起来的照旧只有「10 分钟最多 3 次」（8 轮秒接到不了）"""
+        if not (self._c("brake_enable", True) and self._loop_on()):
+            return
+        name = event.get_sender_name() or uid
+        st = self.det.loop(gk, uid, now, [name], fish=True)
+        lv = int((st or {}).get("level") or 0)
+        r = self.brake.replied(
+            gk,
+            uid,
+            now,
+            self.det.evidence(gk, uid, now, self.brake.window),
+            is_bot=True,
+            lv=lv,
+        )
+        if not r or r[0] != "brake":
+            return
+        ph = "、".join(g for g, _a, _b in (st or {}).get("phrases", [])[:3])
+        self._event(
+            "brake",
+            f"{name}({uid}) 是别人家的 AI，跟你的机器人来回说同一套（{ph}；{(st or {}).get('rounds', 0)} 轮，第 {lv} 档）"
+            f"→ 够 {self.brake.need(lv)} 轮就提早刹：先停 {int(self.brake.pause // 60)} 分钟不回它",
+            gk,
+            uid,
+        )
+
+    # ───────── 要叫模型之前：车轱辘话的状态（v0.3.0） ─────────
+    @filter.on_llm_request()
+    async def loop_note(self, event: AstrMessageEvent, req: ProviderRequest):
+        """你的机器人跟这个人来回说同一套 → 这一轮给模型一段状态（只写事实）；
+        对面是认出来的 AI、还没绕起来 → 先提醒别学它的说法。都是这一轮临时加的，不进聊天记录"""
+        try:
+            self._loop_note(event, req)
+        except Exception as e:
+            logger.warning(f"{TAG} 车轱辘话的状态没加上：{e!r}"[:200])
+
+    def _loop_note(self, event, req):
+        if TextPart is None or not self._loop_on():
+            return
+        if event.is_private_chat() or not event.get_group_id():
+            return
+        uid = str(event.get_sender_id())
+        if self._skip(event, uid):
+            return
+        gk, now = self._gk(event), time.time()
+        name = event.get_sender_name() or uid
+        fish = self.is_bot(uid)
+        st = self.det.loop(gk, uid, now, [name], fish=fish)
+        lv = int((st or {}).get("level") or 0)
+        if lv:
+            text = loop_block(st, name)
+            sig = (gk, uid, lv)
+            if text and now - self._loop_log.get(sig, 0) > 300:
+                self._loop_log[sig] = now
+                while len(self._loop_log) > 500:
+                    self._loop_log.pop(next(iter(self._loop_log)))
+                logger.info(
+                    f"{TAG} 车轱辘话：{name}({uid}){'（别人家的 AI）' if fish else ''} {st['mins']} 分钟里跟你的机器人来回 "
+                    f"{st['rounds']} 轮同一套（"
+                    + "、".join(f"{g} {a}/{b}" for g, a, b in st["phrases"][:3])
+                    + f"；停滞 {st['stag']}）→ 第 {lv} 档，这一轮给模型状态"
+                )
+        elif fish:
+            text = fish_note(name)
+        else:
+            return
+        if text:
+            req.extra_user_content_parts.append(TextPart(text=text))
 
     # ───────── 让模型看 ─────────
     async def _llm(self, umo, body):
@@ -671,6 +772,7 @@ class FatfishAIGuard(Star):
                     "judge_threshold",
                     "cmd_echo_guard",
                     "cmd_echo_sec",
+                    "loop_enable",
                 )
             },
         }

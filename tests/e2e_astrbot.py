@@ -11,6 +11,9 @@
   G 机器人们在回指令（v0.2.0）：这个群开了 AstrBot 的主动回复（概率 1）、装了一个测试用的复读插件；
     别家的机器人发「/stop」→ AstrBot 照常回指令；三个机器人同一秒回「管理命令仅管理员可用。」→ 不跟着复读、主动回复也不接；
     过了 15 秒普通的话照常接；让模型看那几个号时：回指令的那句不算秒接、「/stop」不算 @ 它、AstrBot 回的指令不算机器人说的话
+  H 车轱辘话（v0.3.0）：真人「阿循」跟机器人来回说同一套 8 轮 → 每轮照常回；来回几轮以后，这一轮给模型的请求里带上状态
+    「你们在来回说同一套」（哪几个说法、各几次；绕够了写「已经是车轱辘话了」）；对面是认出来的 AI（座头鲸）→ 每次回它都先提醒别学它的说法；
+    真人（老王）的请求里两样都没有
   F 重启以后名单还在
 用法：python tests/e2e_astrbot.py [插件目录 默认上一层] [--keep]
   需要装了 astrbot（测过 4.29.3、4.29.4）的 Python，astrbot 命令在 PATH 里；另外要 aiohttp、pyjwt、websockets（装 astrbot 时都会带上）
@@ -48,6 +51,7 @@ CMDBOT, BOT_A, BOT_B, BOT_C = (
     60004,
 )  # G：发指令的、回指令的几个机器人（号都是编的）
 G1, G2, G3, G4 = 7001, 7002, 7003, 7004
+G5, LOOPER = 7005, 30005  # H：跟机器人来回说同一套的真人（号是编的）
 RES = []
 
 
@@ -117,7 +121,8 @@ async def chat_completions(request):
         text = json.dumps(out, ensure_ascii=False)
     else:
         chat_calls.append(last)
-        text = f"收到第{len(chat_calls)}句"
+        # H：他说「晚安循环…」→ 回一模一样的一句（车轱辘话）
+        text = "晚安啦 明天见 好梦哦" if "晚安循环" in last else f"收到第{len(chat_calls)}句"
     return web.json_response(
         {
             "id": "x",
@@ -160,6 +165,7 @@ class FakeQQ:
             BOT_A: "阿乙",
             BOT_B: "阿丙",
             BOT_C: "阿丁",
+            LOOPER: "阿循",
         }
         self.new_sent = asyncio.Event()
 
@@ -442,6 +448,14 @@ async def main():
             await asyncio.sleep(1.2 + (i % 3))
         check(n == 12, f"真人连着 @ 了 12 次：回了 {n} 次（不刹）", n)
         check(
+            chat_calls
+            and not any(
+                "# 对面是别人部署的 AI" in x or "# 你们在来回说同一套" in x
+                for x in chat_calls
+            ),
+            "真人正常聊：给模型的请求里没有「别人部署的 AI」「来回说同一套」（v0.3.0）",
+        )
+        check(
             not any("老王" in x for x in judge_calls),
             "真人（跟机器人你一句我一句聊得快）没被叫模型看",
             [x[:200] for x in judge_calls],
@@ -487,6 +501,18 @@ async def main():
         await qq.say(G2, WHALE, "本小姐自己跟自己说")
         await asyncio.sleep(2)
         check(not await qq.wait_reply(G2, t0, timeout=1), "它没 @ 机器人：不主动接")
+        wc = [x for x in chat_calls if "你倒是说话啊" in x]
+        check(
+            wc
+            and all(
+                "# 对面是别人部署的 AI（系统认出来的 不是谁说的话）" in x
+                and "「隔壁的座头鲸」是别人部署的 AI" in x
+                and "别捡它刚用过的词和句式" in x
+                for x in wc
+            ),
+            "回认出来的 AI：每次都先提醒模型别学它的说法（v0.3.0）",
+            wc[:1],
+        )
 
         # ═════════ C 小鲸：刹车 ═════════
         print("\n[C 对聊刹车（模型说像真人 但停不下来）]")
@@ -680,6 +706,49 @@ async def main():
             "没跟着复读" in text and "是在回指令 不接" in text,
             "日志写清楚了：复读那句是这个插件拦的、主动回复是这个插件拦的",
         )
+        # ═════════ H 车轱辘话（v0.3.0） ═════════
+        print("\n[H 车轱辘话（v0.3.0）]")
+        n0, got = len(chat_calls), 0
+        for i in range(8):
+            t0 = time.time()
+            await qq.say(G5, LOOPER, f"晚安循环 晚安啦 明天见 好梦{i}", at_bot=True)
+            if await qq.wait_reply(G5, t0):
+                got += 1
+            await asyncio.sleep(4.2)  # 隔开一点：别让他看着像几秒连发的机器人
+        hc = [x for x in chat_calls[n0:] if "晚安循环" in x]
+        head = "# 你们在来回说同一套（系统算的 不是谁说的话）"
+        idx = [i for i, x in enumerate(hc) if head in x]
+        check(got == 8, f"真人跟机器人来回说同一套 8 轮：每轮都照常回（{got}）", got)
+        check(
+            len(hc) == 8
+            and idx
+            and idx[0] >= 3
+            and idx == list(range(idx[0], 8))
+            and not any("# 对面是别人部署的 AI" in x for x in hc),
+            "来回几轮以后（不是一开始）每一轮都给模型状态「你们在来回说同一套」；对面是真人 → 不提「别人部署的 AI」",
+            (idx, hc[-1][-700:] if hc else ""),
+        )
+        last = hc[-1] if hc else ""
+        check(
+            "你跟「阿循」这 " in last
+            and "「明天见」（你 " in last
+            and "已经是车轱辘话了" in last
+            and "你自己定" in last,
+            "状态里写着跟谁、哪几个说法、各几次；绕够了 → 已经是车轱辘话了（不写台词）",
+            last[-600:],
+        )
+        text = (ROOT / "astrbot_stdout.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        check(
+            "车轱辘话：阿循" in text and "第 2 档" in text,
+            "日志里记了一行（同一个人同一档 5 分钟一行）",
+        )
+        check(
+            not any(f"阿循({LOOPER})" in x and "刹" in x for x in text.splitlines()),
+            "真人（行为不像机器人）：没刹车",
+        )
+
         await asyncio.sleep(16)
         t0 = time.time()
         await qq.say(G4, HUMAN, "好了说正事 晚上吃啥")
