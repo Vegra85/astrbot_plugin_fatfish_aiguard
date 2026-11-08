@@ -27,12 +27,14 @@
   "judge_low_min_score": {
     "description": "行为分要多少",
     "type": "int",
-    "default": 8
+    "default": 8,
+    "hint": "上面那条用的行为分门槛：秒接、连发、自称本鱼 / 本小姐、括号动作、框架输出加起来。"
   },
   "judge_daily_max": {
     "description": "每天最多让模型看几次",
     "type": "int",
-    "default": 300
+    "default": 300,
+    "hint": "一天里让模型看的次数到这个数就不再看了（防止群多人多的时候花钱太快）。第二天重新算。"
   },
   "bot_reply_limit": {
     "description": "认出来的 AI：每段时间最多回几次",
@@ -43,7 +45,8 @@
   "bot_reply_window_sec": {
     "description": "认出来的 AI：多长时间算一段（秒）",
     "type": "int",
-    "default": 600
+    "default": 600,
+    "hint": "跟上面「最多回几次」配着用：默认 600 秒里最多回 3 次。"
   },
   "brake_enable": {
     "description": "对聊刹车",
@@ -54,12 +57,14 @@
   "brake_rounds": {
     "description": "刹车：来回几轮",
     "type": "int",
-    "default": 8
+    "default": 8,
+    "hint": "还没认出来的号：这段时间里跟你的机器人「秒接」来回够这么多轮、行为又像机器人，就先停一会儿不回它。"
   },
   "brake_window_sec": {
     "description": "刹车：多长时间里数轮数（秒）",
     "type": "int",
-    "default": 600
+    "default": 600,
+    "hint": "数轮数的时间窗：默认 10 分钟里够 8 轮秒接才刹。"
   },
   "brake_fast_sec": {
     "description": "刹车：你的机器人说完多少秒内就接上算「秒接」",
@@ -70,7 +75,8 @@
   "brake_pause_sec": {
     "description": "刹车：停多久（秒）",
     "type": "int",
-    "default": 600
+    "default": 600,
+    "hint": "刹住以后停多久不回它；同时让模型马上再看一眼，模型有把握说是真人就提前放开。"
   },
   "cmd_echo_guard": {
     "description": "别跟着机器人们回指令",
@@ -93,7 +99,8 @@
   "always_bot": {
     "description": "手动认定是 AI 的 QQ 号",
     "type": "list",
-    "default": []
+    "default": [],
+    "hint": "填进来的 QQ 号直接当别人家的 AI（不用等插件认）。"
   },
   "groups": {
     "description": "只在这些群里管（群号）",
@@ -106,5 +113,67 @@
     "type": "bool",
     "default": true,
     "hint": "v0.3.0：你的机器人跟同一个人最近 15 分钟来回说同一套（两边都反复出现同一批说法）→ 这一轮给模型一段状态（只写事实：哪几个说法、各几次、来回几轮，不写台词）；对面是认出来的 AI → 每次回它都先提醒别学它的说法；跟认出来的 AI 已经绕成车轱辘话 → 对聊刹车提早（够 2 轮就停、慢的来回也算）。关掉 = 跟 v0.2.0 一样。"
+  },
+  "self_report": {
+    "description": "认「自报家门」的标记",
+    "type": "bool",
+    "default": true,
+    "hint": "v0.4.0：群名片、QQ 昵称或 QQ 签名里挂着「[bot]」的号直接当别人家的 AI：不攒、不调模型、这一句就算。约定是作者定的，见 README「自报家门」。管理员撤过的（/认ai 真人）、永远当真人的不认。跟「自动认别人家的 AI」互不影响。"
+  },
+  "self_report_tags": {
+    "description": "自报家门：认哪些标记",
+    "type": "list",
+    "default": [
+      "[bot]"
+    ],
+    "hint": "按括号里的字认：写「[bot]」就认 [bot] [BOT] ［bot］ 【bot】 (bot) （Bot），括号里可以有空格。可以自己加，比如「[AI]」「[机器人]」。名字里只是带这几个字、没用括号包着的不算（「robot 爱好者」不算）。清空 = 不认。"
+  },
+  "self_report_sign": {
+    "description": "自报家门：也查 QQ 签名",
+    "type": "bool",
+    "default": true,
+    "hint": "签名不在消息里，要调 NapCat 的接口（get_stranger_info）查：在后台查、不耽误回消息；每个号一天最多查一次，查过的记着（只记有没有标记，不存签名）。查到以后从它下一句开始算。"
+  },
+  "sign_check_gap_sec": {
+    "description": "查签名：全局两次之间至少隔几秒",
+    "type": "int",
+    "default": 30,
+    "hint": "不管多少人说话，查签名最快这么久一次（查太勤容易被 QQ 风控）。轮不上的下次说话再查。"
+  },
+  "sign_check_daily_max": {
+    "description": "查签名：每天最多查几个号",
+    "type": "int",
+    "default": 300,
+    "hint": "今天查够这么多个号就不再查签名了，第二天重新算。"
+  },
+  "self_tag_enable": {
+    "description": "一键给自己挂标记",
+    "type": "bool",
+    "default": false,
+    "hint": "打开以后管理员可以发「/认ai 挂标记」：在下面配置的群里把你的机器人的群名片后面加上「 [bot]」，别的机器人一看就知道它是机器人。改之前私聊发指令的管理员说一声改哪几个群；每改一个群之前先把原来的名片存下来，「/认ai 摘标记」原样改回去；在群里发的指令，群里只回改了几个群，群号和名片的明细私聊给你。会改你的机器人在群里的名字，所以默认关。"
+  },
+  "self_tag_groups": {
+    "description": "挂标记的群（群号）",
+    "type": "list",
+    "default": [],
+    "hint": "留空 = 跟「只在这些群里管」一样；那一项也空 = 你的机器人在的所有群，这时一次最多改 20 个群（按群号从小到大），剩下的再发一次「/认ai 挂标记」接着改。"
+  },
+  "self_tag_sign": {
+    "description": "挂标记时签名也加",
+    "type": "bool",
+    "default": false,
+    "hint": "打开以后「/认ai 挂标记」把 QQ 签名后面也加上「 [bot]」（NapCat 的 set_self_longnick），「/认ai 摘标记」改回原来的签名。"
+  },
+  "asym_in_judge": {
+    "description": "不对称分参与判断",
+    "type": "bool",
+    "default": false,
+    "hint": "v0.4.0 先只记不判（影子模式）：按群里说话的节奏（总在别人说完几秒内接话、几乎不在冷场后起话头、接话快慢很固定）算一个 0~100 的分，面板上看它在已知的机器人 / 真人上分不分得开、每个可疑的号要是算进去会怎样。打开以后：分 ≥ 70 的行为分 +4（「把握 ≥ 65 且行为分 ≥ 8」那条路更容易够上）。看准了再开。"
+  },
+  "human_veto": {
+    "description": "真人信号一票否决",
+    "type": "bool",
+    "default": true,
+    "hint": "v0.4.0：最近主动 @ 过 3 个以上不同的人、自己找别人来回聊（不是被人 @ / 引用着聊，也没找你的机器人）、冷场 20 分钟以上以后自己开过 3 次以上话题的号，光靠行为分（把握 ≥ 65 且行为分 ≥ 8，包括对聊刹车后的复查）不自动标成 AI，只记「观察」（面板能看到）。自报家门、模型把握 ≥ 75、框架回复格式、管理员手动标的照旧。关掉 = 跟 v0.3.2 一样。"
   }
 }

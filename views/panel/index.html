@@ -26,6 +26,9 @@
   th { white-space:nowrap; }
   .tag.ai { color:var(--bad); border-color:var(--bad); }
   .tag.human { color:var(--ok); border-color:var(--ok); }
+  .tag.watch { color:var(--accent); border-color:var(--accent); }
+  .note { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .note p { margin:2px 0; }
   button { font:inherit; font-size:12px; padding:3px 8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; margin:0 4px 2px 0; }
   button:hover { border-color:var(--accent); color:var(--accent); }
   .log li { margin:2px 0; }
@@ -43,6 +46,8 @@
   <div class="card"><b id="n-brakes">-</b><span>现在刹着的</span></div>
   <div class="card"><b id="n-judged">-</b><span>今天让模型看了几次</span></div>
   <div class="card"><b id="n-humans">-</b><span>记成真人的</span></div>
+  <div class="card"><b id="n-watch">-</b><span>观察中（有真人信号 没自动标）</span></div>
+  <div class="card"><b id="n-signs">-</b><span>今天查了几个号的签名</span></div>
 </div>
 
 <h2>认出来的别人家的 AI</h2>
@@ -50,6 +55,12 @@
 
 <h2>最近的判断</h2>
 <div class="wrap"><table id="t-verdicts"></table></div>
+
+<h2>不对称分（群里说话的节奏）</h2>
+<div class="note" id="asym"></div>
+
+<h2>你的机器人挂着的标记（/认ai 挂标记）</h2>
+<div class="note" id="selftag"></div>
 
 <h2>现在刹着的</h2>
 <div class="wrap"><table id="t-brakes"></table></div>
@@ -80,21 +91,50 @@
   let api = null;
 
   function render(d) {
+    const vs = d.verdicts || [], as = d.asym || {}, st = as.stats || {};
     $("n-bots").textContent = (d.bots || []).length + (d.manual_bots || []).length;
     $("n-brakes").textContent = (d.brakes || []).length;
     $("n-judged").textContent = d.judged_today || 0;
     $("n-humans").textContent = (d.humans || []).length;
+    $("n-watch").textContent = vs.filter((v) => v.watch).length;
+    $("n-signs").textContent = (d.signs || {}).on === false ? "关" : ((d.signs || {}).today || 0);
+    const src = (b) => String(b.src || "").indexOf("self_") === 0 ? ' <span class="tag watch">自报家门</span>' : "";
     table($("t-bots"), ["名字", "QQ", "为什么", "什么时候", ""],
-      (d.bots || []).map((b) => "<tr><td>" + esc(b.name) + "</td><td>" + esc(b.uid) + "</td><td>" + esc(b.why) +
-        (b.auto === false ? ' <span class="muted">（手动）</span>' : "") + "</td><td>" + ago(b.t) + "</td><td>" + btn("human", b.uid, "改成真人") + "</td></tr>")
+      (d.bots || []).map((b) => "<tr><td>" + esc(b.name) + src(b) + "</td><td>" + esc(b.uid) + "</td><td>" + esc(b.why) +
+        (b.auto === false ? ' <span class="muted">（手动）</span>' : "") +
+        (b.tag_gone ? ' <span class="tag human" title="标记摘了也照旧当机器人（不自动撤，免得来回切）；其实是真人就点「改成真人」">标记已摘</span> <span class="muted">' + ago(b.tag_gone) + "</span>" : "") +
+        "</td><td>" + ago(b.t) + "</td><td>" + btn("human", b.uid, "改成真人") + "</td></tr>")
         .concat((d.manual_bots || []).map((u) => "<tr><td></td><td>" + esc(u) + '</td><td class="muted">配置里手动填的</td><td></td><td></td></tr>')),
       "还没认出来。");
-    table($("t-verdicts"), ["名字", "QQ", "模型说", "把握", "行为分", "理由", "什么时候", ""],
-      (d.verdicts || []).map((v) => "<tr><td>" + esc(v.name) + "</td><td>" + esc(v.uid) + "</td><td>" +
-        (v.mixed ? '<span class="tag human">混用号</span>' : v.bot ? '<span class="tag ai">AI</span>' : '<span class="tag human">真人</span>') +
-        "</td><td>" + esc(v.conf) + "</td><td>" + esc(v.score) + "</td><td>" + esc(v.why) + "</td><td>" + ago(v.t) + "</td><td>" +
-        btn("bot", v.uid, "标成 AI") + btn("forget", v.uid, "清掉重看") + "</td></tr>"),
+    const asymCol = as.on ? "不算的话" : "要是算进去";
+    table($("t-verdicts"), ["名字", "QQ", "模型说", "把握", "行为分", "不对称分", asymCol, "理由", "什么时候", ""],
+      vs.map((v) => {
+        const a = v.asym_now != null ? v.asym_now : v.asym;
+        return "<tr><td>" + esc(v.name) + "</td><td>" + esc(v.uid) + "</td><td>" +
+          (v.mixed ? '<span class="tag human">混用号</span>' : v.bot ? '<span class="tag ai">AI</span>' : '<span class="tag human">真人</span>') +
+          (v.watch ? ' <span class="tag watch">观察</span>' : "") +
+          "</td><td>" + esc(v.conf) + "</td><td>" + esc(v.score) + "</td><td" + (v.asym_txt ? ' title="' + esc(v.asym_txt) + '"' : "") + ">" +
+          (a == null ? '<span class="muted">—</span>' : esc(a) + (v.asym != null && v.asym_now != null && v.asym !== v.asym_now ? ' <span class="muted">（判时 ' + esc(v.asym) + "）</span>" : "")) +
+          "</td><td>" + (v.asym_if ? esc(v.asym_if) + (v.asym_plus ? ' <span class="muted">（+' + esc(v.asym_plus) + "）</span>" : "") : '<span class="muted">—</span>') +
+          "</td><td>" + esc(v.why) + (v.watch ? '<br><span class="muted">真人信号：' + esc(v.watch) + "</span>" : "") +
+          "</td><td>" + ago(v.t) + "</td><td>" + btn("bot", v.uid, "标成 AI") + btn("forget", v.uid, "清掉重看") + "</td></tr>";
+      }),
       "还没让模型看过谁。");
+    $("asym").innerHTML =
+      "<p>" + (as.on ? "<b>参与判断中</b>：分 ≥ " + esc(as.min) + " 的行为分 +" + esc(as.bonus) + "。"
+        : "<b>影子模式</b>（只记不判）：上面每个号的「要是算进去」就是打开「不对称分参与判断」后的结果（分 ≥ " + esc(as.min) + " 的行为分 +" + esc(as.bonus) + "）。") + "</p>" +
+      "<p>拿认出来的 AI 和真人名单（含管理员）当标注：机器人 " + esc(st.bots || 0) + " 个" +
+      (st.bot_med != null ? "（中位数 " + esc(st.bot_med) + "）" : "") + "、真人 " + esc(st.humans || 0) + " 个" +
+      (st.human_med != null ? "（中位数 " + esc(st.human_med) + "）" : "") +
+      (st.auc != null ? "；AUC " + esc(st.auc) + "（1 = 完全分得开、0.5 = 瞎猜）" : "") + " → <b>" + esc(st.verdict || "") + "</b></p>" +
+      "<p class=\"muted\">分 ≥ " + esc(as.min) + "（开了会加分）的：机器人 " + esc(st.bot_hit || 0) + " 个、真人 " + esc(st.human_hit || 0) +
+      " 个（真人里多的话别开，会误伤）。时间线只在内存里，重启从头攒；只看最近 6 小时。</p>";
+    const tg = d.self_tag || {};
+    $("selftag").innerHTML = (tg.groups || []).length || tg.sign
+      ? (tg.groups || []).map((g) => "<p>群 " + esc(g.g) + "：「" + esc(g.new) + "」" + (g.ok ? "" : ' <span class="muted">（当时没改成）</span>') +
+          ' <span class="muted">原来「' + esc(g.old) + "」</span></p>").join("") +
+        (tg.sign ? "<p>签名也挂着</p>" : "") + '<p class="muted">发「/认ai 摘标记」原样改回去。</p>'
+      : '<p class="muted">没有用「/认ai 挂标记」挂过（默认关，配置里打开）。别人家的机器人挂着标记的会出现在上面「认出来的」里，标着「自报家门」。</p>';
     table($("t-brakes"), ["QQ", "群", "还剩", ""],
       (d.brakes || []).map((b) => "<tr><td>" + esc(b.uid) + "</td><td>" + esc(b.g) + "</td><td>" + Math.ceil(b.left / 60) + " 分钟</td><td>" +
         btn("release", b.uid, "解除") + "</td></tr>"),

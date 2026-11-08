@@ -19,6 +19,9 @@
      最后一来一回都是同一套（「晚安啦 明天见」来回十几轮）。现在：我们的机器人回某个人的话、和他在这个群最近 15 分钟说的话，
      两边都反复出现同一批 2~4 个字的说法 → 算出来回几轮、停滞多少（最近几句里新词的比例）→ 分档；
      到档了这一轮给模型一段状态（只写事实），对面是认出来的 AI 时每次都先提醒别学它的说法；已经绕成车轱辘话的，对聊刹车提早。
+  8. 真人信号一票否决（v0.4.0，来自作者那边 11-07：一个真人被行为分标成了 AI）：模型把握不到 75、靠「行为分 ≥ 8」才够标的，
+     他最近要是有真人信号（主动 @ 过好几个人、自己找别人来回、冷场很久后开过话题 —— core/rhythm.py 算）→ 不标，只记「观察」。
+     不对称分（v0.4.0 影子模式）：判的时候顺便算一下「要是算进去（行为分 + 几分）会怎样」，记下来给面板看。
 """
 
 import json
@@ -46,7 +49,7 @@ SELFISH = re.compile(
 )
 BRACKET = re.compile(
     r"[（(](?!回复了)[^（）()]{4,30}[）)]"
-)  # 括号动作「（尾巴一摆，缩回屏幕后面去了）」
+)  # 括号动作「（甩甩尾巴，躲回屏幕后面）」
 ATNL = re.compile(
     r"^@[^\s@]{1,30}[ 　]*\n"
 )  # 「@某人」后面直接换行再说话（bot 框架的回复格式）
@@ -57,7 +60,7 @@ THINK = re.compile(
     r"话题是|接个梗就行|我(先)?(想想|分析一下)|思考[:：]|回复思路)|(根据|按照?)(人设|设定|系统提示|system ?prompt)",
     re.I | re.M,
 )
-# 漏出来的格式标签：成对的「<h>这不是本小姐吗</h>」、或者开头就是收尾标签「</think>好的…」；真人问「<think> 标签怎么去掉」不算
+# 漏出来的格式标签：成对的「<h>本小姐驾到</h>」、或者开头就是收尾标签「</think>好的…」；真人问「<think> 标签怎么去掉」不算
 MARKUP = re.compile(
     r"<(h|think|thinking|reply|msg|message|response|output|answer|sys|system|assistant|content|text)>[^<\s][^<]{0,119}</\1>"
     r"|^\s*</(h|think|thinking|reply|response|output|answer|assistant)>",
@@ -283,6 +286,34 @@ def fish_note(name):
         f"「{name}」是别人部署的 AI：它爱顺着你的话头说、学你的说法，聊着聊着两边就越来越像。"
         "说你自己的：别捡它刚用过的词和句式，也别重复你前几句的说法；没新东西可说就收个尾。"
     )
+
+
+# 判完的结果 → 大白话（日志、面板、「要是算进去会怎样」都用这个）
+KIND_TEXT = {
+    "mark": "会标",
+    "watch": "只记「观察」（有真人信号 不自动标）",
+    "mixed": "不标（混用号）",
+    "unsure": "不标（把握不够）",
+    "human": "不标（像真人）",
+}
+
+
+def rule(verdict, score, atnl, threshold=75, low=65, low_score=8, veto=()):
+    """模型的回答 + 行为 → (结果, 走的哪条路)。
+    结果：mark 标 / watch 观察（本来够标、但有真人信号 v0.4.0）/ mixed 混用号 / unsure 把握不够 / human 像真人；
+    路：conf 模型把握够 / low 把握 ≥ low 而且行为分 ≥ low_score / fp 框架的回复格式（@人后直接换行）≥ 3 次。
+    真人信号（veto）只拦 low（刹车后的复查走的也是这几条路，一样拦）：那条是模型没把握、靠行为分够上的。
+    模型自己有把握（conf）照标；fp 是框架自己的输出格式（真人几乎打不出来）也照标（11-08 复查：任务书只说拦 low）"""
+    is_bot, conf, _why, mixed = verdict
+    if mixed:
+        return "mixed", ""
+    if is_bot and conf >= threshold:
+        return "mark", "conf"
+    if is_bot and conf >= low and score >= low_score:
+        return ("watch" if veto else "mark"), "low"
+    if atnl >= 3:
+        return "mark", "fp"
+    return ("unsure" if is_bot else "human"), ""
 
 
 class Detector:
@@ -572,10 +603,31 @@ class Detector:
             bool(j.get("mixed")),
         )
 
-    def decide(self, uid, name, gk, verdict, now, threshold=75, low=65, low_score=8):
-        """模型判完 → ("mark" / "mixed" / "unsure" / "human", 行为, 说明)；判断结果记进 store"""
+    def decide(
+        self,
+        uid,
+        name,
+        gk,
+        verdict,
+        now,
+        threshold=75,
+        low=65,
+        low_score=8,
+        veto=(),
+        asym=None,
+        asym_plus=0,
+        asym_on=False,
+    ):
+        """模型判完 → ("mark" / "watch" / "mixed" / "unsure" / "human", 行为, 说明)；判断结果记进 store。
+        veto（v0.4.0）：他最近的真人信号 [(哪种, 说明)] —— 有的话「光靠行为」那几条路不标，只记「观察」。
+        asym / asym_plus / asym_on（v0.4.0）：不对称分、要是参与判断行为分加几分、现在参与没有；
+        不管参与没有，都把「开关另一边会怎样」记下来给面板看（影子模式就是靠这个看准了再开）"""
         is_bot, conf, why, mixed = verdict
         ev = self.evidence(gk, uid, now)
+        veto = list(veto or ())
+        plus = int(asym_plus or 0) if asym is not None else 0
+        s_now = ev["score"] + (plus if asym_on else 0)
+        kind, path = rule(verdict, s_now, ev["atnl"], threshold, low, low_score, veto)
         fp = ev["atnl"] >= 3 and not mixed  # 框架的回复格式出现好几次：模型说像真人也标
         r = self.store["verdicts"].setdefault(str(uid), {})
         r.update(
@@ -585,40 +637,57 @@ class Detector:
             conf=conf,
             why=why,
             score=int(ev["score"]),
+            g=str(gk),
         )
         if mixed:
             r["mixed"] = True
         else:
             r.pop("mixed", None)
-        if mixed:
-            return "mixed", ev, f"像是真人号挂着机器人（{why} 把握 {conf}）不标"
-        if is_bot and conf >= threshold:
-            return "mark", ev, f"模型看了最近的话：{why}（把握 {conf}）"
-        if is_bot and conf >= low and ev["score"] >= low_score:
-            return (
-                "mark",
-                ev,
-                f"模型看了最近的话：{why}（把握 {conf}）+ 行为分 {ev['score']}",
+        if asym is None:
+            for k in ("asym", "asym_plus", "asym_on", "asym_if"):
+                r.pop(k, None)
+        else:
+            s_alt = ev["score"] + (0 if asym_on else plus)
+            alt, _ = rule(verdict, s_alt, ev["atnl"], threshold, low, low_score, veto)
+            r.update(
+                asym=int(asym), asym_plus=plus, asym_on=bool(asym_on), asym_if=alt
             )
-        if fp:
+        sig = "；".join(d for _k, d in veto)
+        if kind == "watch":
+            r["watch"] = {"t": now, "why": sig, "path": path}
+        else:
+            r.pop("watch", None)
+        sc = f"{ev['score']}" + (f"（含不对称分 +{plus}）" if asym_on and plus else "")
+        if kind == "mixed":
+            return kind, ev, f"像是真人号挂着机器人（{why} 把握 {conf}）不标"
+        if kind == "mark" and path == "conf":
+            return kind, ev, f"模型看了最近的话：{why}（把握 {conf}）"
+        what = ""
+        if path == "low":
+            what = f"模型看了最近的话：{why}（把握 {conf}）+ 行为分 {sc}"
+        elif path == "fp":
+            what = f"bot 框架的回复格式（@人后直接换行）{ev['atnl']} 次；模型把握 {conf}"
+        if kind == "mark":
+            return kind, ev, what
+        if kind == "watch":
             return (
-                "mark",
+                kind,
                 ev,
-                f"bot 框架的回复格式（@人后直接换行）{ev['atnl']} 次；模型把握 {conf}",
+                f"本来够标（{what}），但最近有真人信号：{sig} → 不自动标，只记「观察」",
             )
         if is_bot:
             return (
                 "unsure",
                 ev,
                 (
-                    f"模型说像 AI 但把握只有 {conf}（要 {threshold}；行为分 {ev['score']} 不到 {low_score} 就要 {threshold}）"
+                    f"模型说像 AI 但把握只有 {conf}（要 {threshold}；行为分 {sc} 不到 {low_score} 就要 {threshold}）"
                     f"先不标 证据再多了会再看（{why}）"
                 ),
             )
         return (
             "human",
             ev,
-            f"模型看了说是真人（{why} 把握 {conf}；行为分 {ev['score']}）",
+            f"模型看了说是真人（{why} 把握 {conf}；行为分 {sc}）",
         )
 
 

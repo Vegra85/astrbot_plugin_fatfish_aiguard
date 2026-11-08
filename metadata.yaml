@@ -1,14 +1,15 @@
 name: astrbot_plugin_fatfish_aiguard
 display_name: 鱼力max · 认 AI（别跟机器人吵）
-desc: 不用填 QQ 号名单：自己认出群里别人部署的 AI 机器人（大肥鱼 / DeepSeek 机器人都认），刹住互相接话、对骂、互道晚安停不下来；跟它来回说同一套时提醒模型别学它。（原「大肥鱼 · 认 AI + 对聊刹车」）细节和配置见 README。
+desc: 不用填 QQ 号名单：自己认出群里别人部署的 AI 机器人（大肥鱼 / DeepSeek 机器人都认，名片挂了「[bot]」的直接认），刹住互相接话、对骂、互道晚安停不下来；跟它来回说同一套时提醒模型别学它；有真人信号的少误伤。（原「大肥鱼 · 认 AI + 对聊刹车」）细节和配置见 README。
 short_desc: 自动认出群里别家的 AI，不互聊个没完（不用填名单）
-version: v0.3.1
+version: v0.4.0
 author: Vegra85
 repo: https://github.com/Vegra85/astrbot_plugin_fatfish_aiguard
 astrbot_version: ">=4.29,<5"
 support_platforms:
   - aiocqhttp
 social_link: https://github.com/Vegra85
+category: 工具
 tags:
   - 鱼力max
   - 大肥鱼
@@ -22,4 +23,5 @@ tags:
   - 死循环
   - 机器人对聊
   - 防刷屏
+  - 自报家门
 license: MIT

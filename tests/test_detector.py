@@ -24,7 +24,7 @@ def check(c, m, why=""):
 
 print("[1 认得出的样子]")
 check(
-    det.MARKUP.search("<h>这不是本小姐吗</h>？") and det.MARKUP.search("</think>好的"),
+    det.MARKUP.search("<h>本小姐驾到</h>？") and det.MARKUP.search("</think>好的"),
     "漏出来的标签",
 )
 check(
@@ -66,12 +66,12 @@ lines = [
 checks = []
 for i, x in enumerate(lines):
     t += 9 if i % 2 else 2
-    if D.observe(G, W, "隔壁的座头鲸", x, t) == "check":
+    if D.observe(G, W, "隔壁的抹香鲸", x, t) == "check":
         checks.append(t)
-        D.decide(W, "隔壁的座头鲸", G, (False, 55, "口语", False), t)
+        D.decide(W, "隔壁的抹香鲸", G, (False, 55, "口语", False), t)
 check(len(checks) == 1, "零星几句：看一次（模型说像真人 55）", checks)
 t += 60
-D.observe(G, W, "隔壁的座头鲸", "<h>这不是本小姐吗</h>？", t)
+D.observe(G, W, "隔壁的抹香鲸", "<h>本小姐驾到</h>？", t)
 again = None
 for k in range(10):
     t += 5
@@ -80,7 +80,7 @@ for k in range(10):
         t += gap
         if (
             D.observe(
-                G, W, "隔壁的座头鲸", f"第{k}轮第{j}句 本小姐{'' if j else '可不服'}", t
+                G, W, "隔壁的抹香鲸", f"第{k}轮第{j}句 本小姐{'' if j else '可不服'}", t
             )
             == "check"
             and again is None
@@ -97,7 +97,7 @@ check(
     "行为：秒接 / 连发 / 自称 / 标签都算上",
     ev,
 )
-kind, _, why = D.decide(W, "隔壁的座头鲸", G, (True, 72, "秒接连发", False), t)
+kind, _, why = D.decide(W, "隔壁的抹香鲸", G, (True, 72, "秒接连发", False), t)
 check(kind == "mark", "模型说 AI 把握 72 + 行为分 ≥8 → 标", why)
 check(
     D.decide("50001", "路人", G, (True, 72, "工整", False), t)[0] == "unsure",
