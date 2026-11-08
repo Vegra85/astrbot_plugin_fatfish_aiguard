@@ -545,7 +545,7 @@ class FatfishAIGuard(Star):
         else:
             return
         if text:
-            req.extra_user_content_parts.append(TextPart(text=text))
+            req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())   # v0.3.1：临时段，不写进对话记录（11-08 隔壁窗口查出）
 
     # ───────── 让模型看 ─────────
     async def _llm(self, umo, body):
